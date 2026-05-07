@@ -1,0 +1,82 @@
+# Keep in sync with ../redistransport/.golangci.yml
+version: "2"
+run:
+  tests: true
+linters:
+  default: all
+  disable:
+    - canonicalheader
+    - cyclop
+    - depguard
+    - exhaustruct
+    - forcetypeassert
+    # gomodguard is deprecated since v2.12.0 (replaced by gomodguard_v2);
+    # we don't restrict module imports, so disable both rather than migrate.
+    - gomodguard
+    - gomodguard_v2
+    # importas is in the active set but would need an `alias:` list to be
+    # useful — we don't enforce import aliases in this module, so disable it.
+    # Without this, golangci-lint emits an info-level advisory on every run.
+    - importas
+    - lll
+    - mnd
+    - musttag
+    - noinlineerr
+    - nonamedreturns
+    - paralleltest
+    - tagliatelle
+    - testableexamples
+    - testpackage
+    - varnamelen
+    # wsl_v5 is the successor to wsl (deprecated in golangci-lint v2.2.0).
+    - wsl
+    # Caddy framework requires value receiver on CaddyModule() alongside
+    # pointer receivers on all other methods. This is inherent to the framework.
+    - recvcheck
+    # Caddy framework error handling: most errors come from Caddyfile Dispenser
+    # helpers (ArgErr, Errf, WrapErr) which already carry directive/line context
+    # in their returned error types, or from caddyv2.UsagePool.LoadOrNew/Delete
+    # which wrap internally. Wrapping these again adds no signal and obscures
+    # the Caddy error hierarchy.
+    - wrapcheck
+  settings:
+    gomoddirectives:
+      replace-local: true
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - github.com/dunglas/mercure.Codec
+        - github.com/dunglas/mercure.Transport
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - funlen
+          - gochecknoglobals
+          - goconst
+          - godox
+          - noctx
+          - wrapcheck
+        path: _test\.go
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports

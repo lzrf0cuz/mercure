@@ -11,6 +11,9 @@ linters:
   default: all
   settings:
     gomoddirectives:
+      # Permit the local replace directives the fork uses to wire its
+      # multi-module layout (see caddy/go.mod). Without this, the required-
+      # for-build replaces produce a lint failure with no clean alternative.
       replace-local: true
     ireturn:
       allow:
@@ -30,7 +33,10 @@ linters:
     - errcheck
     - exhaustruct
     - forcetypeassert
+    # gomodguard is deprecated since v2.12.0 (replaced by gomodguard_v2);
+    # we don't restrict module imports, so disable both rather than migrate.
     - gomodguard
+    - gomodguard_v2
     - intrange
     - lll
     - mnd
@@ -65,6 +71,16 @@ linters:
       - third_party$
       - builtin$
       - examples$
+      # Skip files compiled only under the deprecated_server / deprecated_transport
+      # build tags. These paths are sunset (replaced by the Caddy server module +
+      # the dedicated transport modules) and are not the target of the fork's
+      # quality bar — silencing them removes pressure to add tactical //nolints
+      # to code we are not actively investing in. The pattern matches
+      # *_deprecated.go (config, metrics, hub, handler), *_deprecated_test.go
+      # (server), and mercure_deprecated_transport.go (the deprecated-tag-only
+      # caddy submodule shim) — explicitly NOT mercure_notdeprecated_transport.go,
+      # which is the active tag-default surface.
+      - (/|^)[a-z]+_deprecated(_test|_transport)?\.go$
 formatters:
   enable:
     - gci
@@ -77,3 +93,4 @@ formatters:
       - third_party$
       - builtin$
       - examples$
+      - (/|^)[a-z]+_deprecated(_test|_transport)?\.go$

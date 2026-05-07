@@ -13,13 +13,17 @@ const EarliestLastEventID = "earliest"
 type Transport interface {
 	// Dispatch dispatches an update to all subscribers.
 	//
-	// It trusts u to be well-formed. A caller that builds u from untrusted
-	// input (e.g. a publisher request) and dispatches it directly instead of
-	// through Hub.Publish MUST call u.Validate first and reject the update on
-	// error, otherwise a CR, LF, or NUL in ID or Type can inject arbitrary SSE
-	// fields into subscribers' streams (CWE-93). Hub-internal updates such as
-	// subscription events are trusted and skip Validate (they use reserved
-	// topics that Validate rejects by design).
+	// It trusts u to be well-formed. Hub.Publish calls Validate before it
+	// reaches here, so the bundled hub and PublishHandler are covered. A caller
+	// that builds u from untrusted publisher input and dispatches it directly,
+	// bypassing Hub.Publish, MUST call Update.Validate first — the full check,
+	// including reserved-topic rejection. A Transport that instead reads
+	// hub-internal updates from an out-of-process backend MUST reject a u whose
+	// id or type fails Update.ValidateSSEFields (a CR/LF/NUL there forges SSE
+	// frame boundaries into subscribers' streams, CWE-93); it uses that narrow
+	// check, not Validate, because those updates ride reserved topics that
+	// Validate rejects by design but that dispatch legitimately (subscription
+	// events).
 	Dispatch(ctx context.Context, u *Update) error
 
 	// AddSubscriber adds a new subscriber to the transport.
@@ -56,6 +60,21 @@ type TransportHealthChecker interface {
 	// for an extended period and should be restarted.
 	// This is typically used for liveness probes (e.g. Kubernetes).
 	Live(ctx context.Context) error
+}
+
+// TransportCodec provides a method to pass the Codec to the transport.
+// Transports implementing this interface will receive the hub-configured codec
+// automatically during hub initialization.
+//
+// CONTRACT: SetCodec is invoked exactly once at hub initialization, before
+// any Dispatch/AddSubscriber/RemoveSubscriber call. Implementations are NOT
+// required to be safe for concurrent SetCodec calls; callers other than the
+// hub initializer must not invoke it. Implementations that store the codec
+// for use by concurrent Dispatch/Unmarshal goroutines must publish the codec
+// safely (e.g. via a sync.Mutex or sync/atomic) so that the happens-before
+// relationship between SetCodec and the first read is preserved.
+type TransportCodec interface {
+	SetCodec(codec Codec)
 }
 
 // ErrClosedTransport is returned by the Transport's Dispatch and AddSubscriber methods after a call to Close.

@@ -48,6 +48,7 @@ The following Mercure-specific directives are available:
 | `publish_origins <origins...>`                             | a list of origins allowed publishing, can be `*` for all (only applicable when using cookie-based auth)                                                                                                                                                                                                                                                              |                        |
 | `cors_origins <origin...>`                                 | a list of allowed CORS origins, ([troubleshoot CORS issues](troubleshooting.md#cors-issues))                                                                                                                                                                                                                                                                         |                        |
 | `cookie_name <name>`                                       | the name of the cookie to use for the authorization mechanism                                                                                                                                                                                                                                                                                                        | `mercureAuthorization` |
+| `require_claim_header <claim> <header> [{ <options...> }]` | require an HTTP request header to agree with a JWT claim, rejecting mismatches with `401`; repeatable, and every applicable binding must hold. See [binding a claim to a header](#binding-a-claim-to-a-header)                                                                                                                                                        | disabled               |
 | `subscriptions`                                            | expose the subscription web API and dispatch private updates when a subscription between the Hub and a subscriber is established or closed. The topic follows the template `/.well-known/mercure/subscriptions/{topicSelector}/{subscriberID}`                                                                                                                       |                        |
 | `heartbeat`                                                | interval between heartbeats (useful with some proxies, and old browsers), set to `0s` disable                                                                                                                                                                                                                                                                        | `40s`                  |
 | `transport <name> [{ <options...> }]`                      | The transport to use. Options are transport-specific. See also [the cluster mode](cluster.md)                                                                                                                                                                                                                                                                        | `bolt://mercure.db`    |
@@ -58,7 +59,14 @@ The following Mercure-specific directives are available:
 | `ui`                                                       | enable the UI but do not expose demo endpoints                                                                                                                                                                                                                                                                                                                       |                        |
 | `topic_selector_cache <maxEntriesPerShard> [<shardCount>]` | Topic Selector cache configuration (pass `-1` to disable the cache, and `0` for an unlimited number of entries)                                                                                                                                                                                                                                                      | `10000` `256`          |
 | `subscriber_list_cache_size <maxSize>`                     | Subscriber list cache size, pass `0` for unlimited                                                                                                                                                                                                                                                                                                                   | `100000`               |
+| `subscriber_out_buffer <size>`                             | per-subscriber out-channel and pre-ready queue capacity; each connected subscriber commits this many update slots up front, so a large fleet may want it lower to cut memory; `0` keeps the default, a positive value below `16` is rejected                                                                                                                            | `1000`                 |
+| `publish_timeout <duration>`                               | maximum duration of a single dispatch; the publish path is detached from the publisher request so a mid-publish disconnect does not abort the write, and this bounds that detached dispatch so a stalled transport cannot block it indefinitely; on timeout the write may already have committed, so the publisher receives `504`; `0s` disables                       | disabled               |
 | `transport_url <url>`                                      | **Deprecated: use `transport` instead.** URL representation of the transport to use. Use `local://local` to disable the history, (example `bolt:///var/run/mercure.db?size=100&cleanup_frequency=0.4`), see also [the cluster mode](cluster.md)                                                                                                                      | `bolt://mercure.db`    |
+
+An unrecognized directive inside the `mercure` block is a configuration error. A misspelled
+directive is therefore refused at startup rather than ignored, which matters most for
+`require_claim_header`: a typo in a security directive that parsed cleanly would leave the
+hub running with the check silently absent.
 
 See also [the list of built-in Caddyfile directives](https://caddyserver.com/docs/caddyfile/directives).
 
@@ -158,6 +166,86 @@ MERCURE_SUBSCRIBER_JWT_KEY=$(cat subscriber.key.pub) \
 MERCURE_SUBSCRIBER_JWT_ALG=RS256 \
 ./mercure run
 ```
+
+### Binding a Claim to a Header
+
+`require_claim_header` rejects a request whose HTTP header disagrees with the JWT it presents.
+The claim and the header are both named by configuration, so the hub never learns what either
+one means:
+
+```caddyfile
+mercure {
+	publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY}
+	subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY}
+	require_claim_header tenants Tenant-ID
+}
+```
+
+A binding applies to both subscribers and publishers by default, which is why both JWT keys
+must be configured above. Narrow it with `roles subscriber` if only subscribers send the
+header.
+
+A subscriber whose token carries `"tenants": ["acme", "beta"]` may now connect only with
+`Tenant-ID: acme` or `Tenant-ID: beta`. Any other value, an absent header, or an absent claim
+is answered with `401`.
+
+Two properties follow. A stolen token cannot be replayed against a tenant it was not issued
+for, and the header becomes trustworthy enough to key metrics, rate limits or routing on —
+the hub has proven it agrees with a signed claim.
+
+The directive is repeatable. Every binding that applies to a request must hold.
+
+```caddyfile
+require_claim_header tenants Tenant-ID {
+	match       auto
+	on_missing  reject
+	roles       all
+}
+```
+
+| Option       | Values                            | Default  | Description                                                                                                                                                          |
+| ------------ | --------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `match`      | `auto`, `member`, `exact`         | `auto`   | which claim shapes the binding accepts. `auto` takes either: a scalar must equal the header, an array must contain it. `member` accepts only an array claim. `exact` accepts only a scalar claim. A claim of the shape the mode forbids is malformed |
+| `on_missing` | `reject`, `allow`                 | `reject` | whether a genuinely absent header or claim rejects the request or skips the binding                                                                                  |
+| `roles`      | `all`, `subscriber`, `publisher`  | `all`    | restrict the binding to subscribe requests, publish requests, or apply it to both                                                                                    |
+
+Use `member` or `exact` when you want the hub to assert the shape your token issuer emits: a
+claim of the wrong shape then fails closed instead of being interpreted.
+
+Claim values are compared case-sensitively; the header *name* is matched case-insensitively,
+as HTTP requires.
+
+`on_missing allow` weakens the binding, and it weakens it only where the operand is truly
+missing. A malformed claim — a number, an object, an array holding a non-string, one longer
+than 1000 entries, or a claim whose shape `match` forbids — and a request that repeats the
+bound header both reject regardless. Absence is a deployment state you may choose to
+tolerate; malformation is not.
+
+Be deliberate about `allow` on the header side: a client can then bypass the binding by not
+sending the header at all, which forfeits the replay protection above. It is meant for
+migrating an existing fleet, not for steady state.
+
+Further constraints:
+
+- Anonymous requests carry no token and therefore no claim, so bindings are skipped for them.
+  The hub warns at startup when a subscriber-scoped binding is combined with `anonymous`.
+  While anonymous subscribers are accepted, a bound header is *not* trustworthy hub-wide, so
+  do not key rate limits or routing on it.
+- A binding must have a key to verify against: a subscriber-scoped binding without
+  `subscriber_jwt` or `subscriber_jwks_url` is a startup error, and likewise for publishers.
+- The claim can be any top-level JWT claim, including string registered ones like `sub`,
+  `iss`, `jti`, or `aud` — but not a claim that never holds a string or string array: the
+  `mercure` claim (and its namespaced form), which is an object, or the numeric `exp`, `nbf`
+  and `iat`. Binding any of those could only ever fail, so it is a startup error.
+- The browser's native `EventSource` cannot set request headers. Subscribers that must send a
+  bound header need a fetch-based SSE client.
+- When `cors_origins` is set, bound headers are added to the CORS preflight allowlist
+  automatically.
+
+Rejections increment [`mercure_claim_header_rejected_total`](metrics.md), labeled by binding
+and reason, which is how a misconfigured binding that is quietly `401`ing a whole tenant
+becomes visible. The hub warns at startup if the configured metrics implementation cannot
+report them.
 
 ## Bolt Adapter
 

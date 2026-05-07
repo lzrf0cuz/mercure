@@ -1,0 +1,103 @@
+# Mercure Hub - Local Development Environment
+# Caddy manages TLS directly (no reverse proxy)
+# TLS is only enabled on the main server — :9091 (metrics) and admin (:2019) are plain HTTP
+# https://mercure.rocks/docs/hub/config
+# https://caddyserver.com/docs/caddyfile
+{
+	# Clean shutdown: cap drain at 10s. Without this, Caddy waits indefinitely
+	# for in-flight SSE connections to close (writeTimeout-driven; default 600s
+	# in prod, 15s in .env.dev). The 10s cap keeps Ctrl+C → wgo rebuild cycles
+	# tight without losing the heartbeat/final-event delivery window.
+	grace_period 10s
+
+	{$GLOBAL_OPTIONS}
+}
+
+# Metrics endpoint (Prometheus-compatible, internal only)
+# Note: Caddy's admin API (:2019) also serves /metrics when enabled.
+# This is a built-in admin feature that cannot be selectively disabled.
+# In production, admin is bound to localhost only — :9091 is the only
+# externally-reachable metrics source.
+:9091 {
+	handle /metrics {
+		metrics
+	}
+	handle {
+		respond 404
+	}
+}
+
+{$CADDY_EXTRA_CONFIG}
+
+{$SERVER_NAME:localhost} {
+	log
+
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API).
+	# Static UI assets at /.well-known/mercure/ui/* are still compressed.
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
+
+	# Same `handle`-block structure as Caddyfile for consistency. Local
+	# dev intentionally exposes the UI (no /ui/* 403 block) — that's the
+	# dev/prod posture difference.
+
+	# Transport-aware health check via the admin API. In dev, admin is
+	# also reachable directly at http://localhost:2019 via the compose
+	# port forward; this route mirrors prod's external-probe pattern so
+	# https://localhost/mercure/health/ready works the same way.
+	handle /mercure/health/* {
+		reverse_proxy 127.0.0.1:2019 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	handle /.well-known/mercure* {
+		# `route` keeps `tracing` ahead of `mercure` in written order (and
+		# tolerates whatever MERCURE_TRACING_DIRECTIVE expands to). Empty by
+		# default — no middleware added, so the dev hub runs trace-free.
+		# `task dev:full:tracing` sets it to `tracing` and points OTEL_* at the
+		# Jaeger sidecar to turn collection on.
+		route {
+			{$MERCURE_TRACING_DIRECTIVE:}
+			mercure {
+				# Human-readable hub identifier used in per-hub health endpoints and metrics labels.
+				# /mercure/health/{$MERCURE_HUB_NAME}/{ready,live} — defaults to "default" if unset.
+				name {$MERCURE_HUB_NAME:default}
+				# JWT authentication. Values are read from the env vars set in
+				# .env.dev (HS256 demo secret). {env.VAR} is the runtime placeholder
+				# (resolved at module Provision via populateJWTConfig in
+				# caddy/mercure.go), so multi-line PEM keys survive intact if you
+				# switch to RS256. The {$VAR} parse-time form would mangle them.
+				# See .env.dev "RS256 with PEM key" section to switch.
+				publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+				subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+				# Extra directives (cors, transport, features, etc.)
+				{$MERCURE_EXTRA_DIRECTIVES}
+			}
+		}
+	}
+
+	handle /robots.txt {
+		respond `User-agent: *
+        Disallow: /`
+	}
+
+	# Development: redirect root to Mercure UI. Top-level (not inside a
+	# `handle /` block) because redir's `<to>` arg is parsed as a path
+	# matcher when it starts with `/` inside a handle block — `redir / <to>`
+	# is the unambiguous form. Caddy's directive_order puts redir before
+	# handle, so this fires for `/` requests before the catchall handle.
+	redir / /.well-known/mercure/ui/ 302
+
+	handle {
+		respond "Not Found" 404
+	}
+
+	{$CADDY_SERVER_EXTRA_DIRECTIVES}
+
+	# Skip logging for health/utility endpoints
+	log_skip /robots.txt
+	log_skip /favicon.ico
+}

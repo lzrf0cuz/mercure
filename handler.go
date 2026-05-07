@@ -1,9 +1,12 @@
 package mercure
 
 import (
-	"io/fs"
+	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"path"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
@@ -16,6 +19,13 @@ const (
 	defaultDemoURL = defaultUIURL + "demo/"
 )
 
+// initHandler wires the mux, CSP, secure middleware, CORS, and (when
+// enabled) the demo + UI/fixtures gating. Length and nesting are inherent
+// to a single setup function that has to span all those concerns; splitting
+// would scatter related routing decisions across multiple helpers without
+// changing the underlying complexity.
+//
+//nolint:funlen,nestif // see comment above.
 func (h *Hub) initHandler() {
 	router := mux.NewRouter()
 	router.UseEncodedPath()
@@ -28,14 +38,38 @@ func (h *Hub) initHandler() {
 	}
 
 	if h.ui {
-		public, err := fs.Sub(uiContent, "public")
-		if err != nil {
-			panic(err)
+		fileServer := http.StripPrefix(defaultUIURL, http.FileServer(http.FS(publicFS(h.logger))))
+
+		if h.demo {
+			router.PathPrefix(defaultUIURL).Handler(fileServer)
+		} else {
+			// public/fixtures/ ships demo-only artefacts (private JWK,
+			// demo HS256 secret, pre-minted demo tokens). The router runs
+			// with UseEncodedPath()+SkipClean(true) for the protocol routes,
+			// which lets percent-encoded segments and `..` traversal sneak
+			// past a plain PathPrefix matcher (FileServer decodes+cleans
+			// before the file lookup). Gate against path.Clean(r.URL.Path)
+			// here so encoded variants resolve to the same comparison.
+			const fixturesPath = defaultUIURL + "fixtures"
+			router.PathPrefix(defaultUIURL).Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				cleaned := path.Clean(r.URL.Path)
+				if cleaned == fixturesPath || strings.HasPrefix(cleaned, fixturesPath+"/") {
+					http.NotFound(w, r)
+
+					return
+				}
+
+				fileServer.ServeHTTP(w, r)
+			}))
 		}
 
-		router.PathPrefix(defaultUIURL).Handler(http.StripPrefix(defaultUIURL, http.FileServer(http.FS(public))))
-
-		csp += " mercure.rocks cdn.jsdelivr.net"
+		csp = strings.Join([]string{
+			"default-src 'self' mercure.rocks cdn.jsdelivr.net cdnjs.cloudflare.com fonts.googleapis.com",
+			"script-src 'self' cdn.jsdelivr.net cdnjs.cloudflare.com",
+			"style-src 'self' 'unsafe-inline' cdn.jsdelivr.net cdnjs.cloudflare.com fonts.googleapis.com",
+			"font-src 'self' fonts.gstatic.com cdnjs.cloudflare.com data:",
+			"connect-src 'self' cdn.jsdelivr.net",
+		}, "; ")
 	}
 
 	h.registerSubscriptionHandlers(router)
@@ -63,14 +97,38 @@ func (h *Hub) initHandler() {
 		return
 	}
 
+	corsOptions := cors.Options{
+		AllowedOrigins:   h.corsOrigins,
+		AllowCredentials: true,
+		AllowedHeaders:   h.corsAllowedHeaders(),
+		Debug:            h.debug,
+	}
+
+	// rs/cors emits debug traces only when Debug is set. Route them through the
+	// hub's structured logger at Debug level instead of rs/cors's default
+	// "[cors] " stdout logger, so they're leveled and filterable like every other
+	// hub log line. This unifies the output; it does not silence it.
+	if h.debug {
+		corsOptions.Logger = corsLogger{h.logger}
+	}
+
+	if h.demo {
+		// Expose Link header for cross-origin hub discovery.
+		corsOptions.ExposedHeaders = []string{"link"}
+	}
+
 	h.handler = secureMiddleware.Handler(
-		cors.New(cors.Options{
-			AllowedOrigins:   h.corsOrigins,
-			AllowCredentials: true,
-			AllowedHeaders:   []string{"authorization", "cache-control", "last-event-id"},
-			Debug:            h.debug,
-		}).Handler(router),
+		cors.New(corsOptions).Handler(router),
 	)
+}
+
+// corsLogger adapts rs/cors's Logger interface onto the hub's slog, logging each
+// trace at Debug level with the trace text under a "detail" attribute.
+type corsLogger struct{ logger *slog.Logger }
+
+func (l corsLogger) Printf(format string, v ...any) {
+	l.logger.LogAttrs(context.Background(), slog.LevelDebug, "cors",
+		slog.String("detail", strings.TrimSpace(fmt.Sprintf(format, v...))))
 }
 
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {

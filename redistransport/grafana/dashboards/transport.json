@@ -1,0 +1,3342 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Mercure redistransport: dispatch hot path, subscriber lifecycle (3-RT/4-RT load-testing signals), publish + XREADGROUP, history replay, errors, presence, and go-redis connection pool. Provisioned and locked (`editable: false`) — UI edits won't persist; fork via the dashboard menu's Save As for local experiments, or edit `redistransport/grafana/dashboards/transport.json` and re-provision.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Mercure Hub",
+      "tooltip": "Hub-level metrics (subscribers, disconnects, runtime, process)",
+      "type": "link",
+      "url": "/d/mercure-hub"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 100,
+      "title": "Transport",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 1,
+      "title": "Transport version",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "redistransport build version label from mercure_redis_build_info.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, version) (mercure_redis_build_info{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} {{version}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "options": {
+                "": {
+                  "text": "(no transport)"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "textMode": "name"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Healthy",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "mercure_redis_healthy: 1 = transport reaching backend, 0 = health_threshold consecutive PING failures (load-shedding engaged). Multi-backend: one cell per `backend_type`; if ANY selected backend is unhealthy, that cell shows 0.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "min by (backend_type) (mercure_redis_healthy{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{backend_type}} healthy",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "OK",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Stream length",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current XLEN of the mercure stream. Capped by max_length / event_ttl trim.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (backend_type) (mercure_redis_stream_length{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{backend_type}} stream_length",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Consumer lag",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "XINFO GROUPS lag — entries the consumer group has yet to read. -1 (non-deterministic group state) is clamped to 0 in the max so it doesn't dominate; a count of unknown-state nodes is the second series. Sustained non-zero on the max series is the primary backpressure signal. Filter `$instance` to localize which replica is lagging. If both series are absent the metric isn't being scraped — check Prometheus targets.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (backend_type) (clamp_min(mercure_redis_consumer_lag{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}, 0))",
+          "legendFormat": "{{backend_type}} lag",
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "count(mercure_redis_consumer_lag{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"} == -1)",
+          "legendFormat": "unknown",
+          "refId": "B",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": true
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Consumer pending",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "PEL size — XREADGROUP'd messages not yet XACK'd. Sustained growth past xreadgroup_batch_size churn = reading but not dispatching+acking.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (backend_type) (mercure_redis_consumer_pending{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{backend_type}} pending",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 1000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Clock drift",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Hub clock — Redis clock at connect time. Sampled once at NewRedisTransport. Large drift breaks UUIDv7 → stream-ID seek (clockSkewMargin tuning).",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (backend_type) (abs(mercure_redis_clock_drift_seconds{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}))",
+          "legendFormat": "{{backend_type}} drift",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 101,
+      "title": "Dispatch path",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "title": "Dispatch duration p99 by shard",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per-shard p99 of dispatch_duration_seconds. Load-testing 3-RT/4-RT pass criterion: p99 < 50 ms during ramp-down. Skew across shards = bad subscriber-ID hash.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, shard, le) (rate(mercure_redis_dispatch_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} shard {{shard}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Shard balance (subscribers per shard)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "mercure_redis_shard_subscribers{shard} — should be balanced. Load-testing 4-RT pass criterion: max/min ratio ≤ 1.5.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "mercure_redis_shard_subscribers{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} | {{backend_type}} shard {{shard}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Dispatch duration (aggregated)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Aggregated dispatch_duration_seconds p50, p99 across all shards. Load-testing 7-RT pass: msgpack p99 reduced ≥ 25 % vs json at ≥ 1k publishes/s.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_dispatch_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_dispatch_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Subscribers matched per dispatch",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of dispatch_subscribers_matched. Whale-tenant signal: one tenant ≥ 30 % of total p99 = Phase 2 isolation trigger.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_dispatch_subscribers_matched_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_dispatch_subscribers_matched_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 102,
+      "title": "Subscriber lifecycle",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "title": "Add subscriber duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of add_subscriber_duration_seconds. Load-testing ramp-up signal: p99 rising = t.mu contention or TLS backpressure.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_add_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_add_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Remove subscriber duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of remove_subscriber_duration_seconds. Load-testing 3-RT ramp-down disconnect-avalanche signal — A15 trigger if p99 spikes here.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_remove_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_remove_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Subscriber/publisher rate-limited",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of add/remove + rate-limiter activations. Sustained subscriber_rate_limited > 0 during a deployment is the limiter absorbing a reconnect storm (8-RT pass).",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 23
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_subscriber_add_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} add/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_subscriber_remove_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} remove/sec",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_subscriber_rate_limited_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} subscriber rate-limited/sec",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_publisher_rate_limited_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} publisher rate-limited/sec",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Subscribers lost by reason",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Stacked rate of subscribers_lost_total{reason}. history_replay_failed = 9-RT trigger; other reasons surface transport-initiated drops bypassing the normal RemoveSubscriber path.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, reason) (rate(mercure_redis_subscribers_lost_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "sum",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 103,
+      "title": "Publish & XREADGROUP",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "title": "Publish duration",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of publish_duration_seconds. Load-testing 8-RT: must stay bounded — if it grows with stream length, the Lua publish script is O(n).",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_publish_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_publish_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "XREADGROUP latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of xreadgroup_latency_seconds — round-trip from BLOCK to entry batch arriving.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 38
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_xreadgroup_latency_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_xreadgroup_latency_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "XREADGROUP batch size",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50 of entries returned per XREADGROUP call. Load-testing 8-RT pass: p50 > 1.0 under load = Redis batching properly. Stuck at 1.0 = poll-limited (raise xread_count or lower xread_block).",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 38
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_xreadgroup_batch_size_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_xreadgroup_batch_size_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 39,
+      "title": "Publish payload size",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per-event payload size in bytes after codec encoding (XADD message body). p50 / p99 over the rate interval. Pair against the Redis-server `Network throughput` panel (bytes/sec input) and `Publish duration` p99 to predict bandwidth scaling and to spot publish-latency regressions caused by payload-size shifts during load tests.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_publish_payload_bytes_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_publish_payload_bytes_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 104,
+      "title": "History replay",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "panels": []
+    },
+    {
+      "id": 18,
+      "title": "History replay duration & concurrency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p99 history_replay_duration_seconds (fleet-aggregate; per-replica triage by filtering `$instance`) + history_replay_concurrent gauge (per-instance). Load-testing 9-RT pass: concurrent stays ≤ historyReplayConcurrency cap.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_history_replay_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} duration p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (instance, backend_type) (mercure_redis_history_replay_concurrent{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} concurrent",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          },
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*concurrent$"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "title": "History replay fallback rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of replays that fell through to Pass 2 (requested Last-Event-ID was past retention). Sustained non-zero = retention too tight for the reconnect window.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_history_replay_fallback_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} fallback/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 45,
+      "title": "History replay truncated rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of replays cut short before delivering the full backlog (subscriber disconnected — for any reason — or buffer full). Sustained non-zero = reconnecting clients miss history (slow consumers or restart churn). Aggregate companion to the mercure.history.truncated span attribute.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_history_replay_truncated_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} truncated/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 105,
+      "title": "Errors",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "title": "XREADGROUP errors by kind",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Load-testing critical signal. nogroup is transient; other / nogroup_recreate_failed are sustained concerns.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, kind) (rate(mercure_redis_xreadgroup_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} {{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "Publish errors by kind",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Stacked rate of publish_errors_total{kind}.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, kind) (rate(mercure_redis_publish_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} {{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Operational errors",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Combined rate of zombie_gc_errors_total, ttl_cleanup_errors_total, presence_heartbeat_errors_total, presence_read_errors_total{kind}, stream_decode_errors_total{kind}, history_cursor_rejected_total.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_zombie_gc_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} zombie_gc",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_ttl_cleanup_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} ttl_cleanup",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_presence_heartbeat_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} presence_heartbeat",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, kind) (rate(mercure_redis_presence_read_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} presence_read {{kind}}",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, kind) (rate(mercure_redis_stream_decode_errors_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} stream_decode {{kind}}",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_history_cursor_rejected_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} history_cursor_rejected",
+          "refId": "F"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 40,
+      "title": "Pre-binding metric drops",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "mercure_redis_pre_binding_metric_drops_total — running count of metric-emission attempts that landed before RegisterMetricsWith bound the collector. Non-zero means the late-binding window covered live traffic; bind metrics earlier in the lifecycle (direct API: WithPrometheusRegisterer; Caddy: parent metrics_registry threaded through bindTransportMetrics in Provision). Read-through CounterFunc, so the value is the running atomic total at scrape time. Fleet-aggregate (`sum by (backend_type)`); filter `$instance` to localize which replica is dropping. Binary alarm: any non-zero is the operator signal.",
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 68
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (backend_type) (mercure_redis_pre_binding_metric_drops_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{backend_type}} drops",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 106,
+      "title": "Presence",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      },
+      "panels": []
+    },
+    {
+      "id": 23,
+      "title": "Presence payload bytes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "p50/p99 of presence_payload_bytes — size of presence SET serialized to Redis. Above presenceDetailThreshold (default 10k subscribers per node) the codec switches to summary mode.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (backend_type, le) (rate(mercure_redis_presence_payload_bytes_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p99",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (backend_type, le) (rate(mercure_redis_presence_payload_bytes_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{backend_type}} p50",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "title": "Presence read skipped",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of per-key skips during GetSubscribers SCAN (key expired mid-scan or empty value). Steady-state non-zero is normal; sudden correlated drop in subscriber count + jump here = transport eviction event.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_presence_read_skipped_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} skipped/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 108,
+      "title": "Throughput",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      },
+      "panels": []
+    },
+    {
+      "id": 28,
+      "title": "Operations per second (hot paths)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Throughput across hot paths via histogram _count derivatives. Pair with the duration p99 panels to spot latency degradation under load (8-RT publisher-rate ceiling: dispatch p99 < 50ms at target rate; correlate target rate here with Panel 9).",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_dispatch_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} dispatches/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_publish_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} publishes/sec",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_xreadgroup_latency_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} xreadgroup cycles/sec",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_history_replay_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} history replays/sec",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 107,
+      "title": "Connection pool",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "title": "Pool connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per-instance go-redis client pool: total connections vs idle, one pair of lines per replica. A line approaching configured PoolSize = pressure on that replica (raise pool or shed load); single hot replica is visible without filtering.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 89
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (mercure_redis_client_pool_total_conns{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} total",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (mercure_redis_client_pool_idle_conns{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} idle",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "title": "Pool timeouts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of pool acquisition timeouts. Load-testing 7-RT/8-RT critical signal: must stay 0. Non-zero rate = Redis I/O saturating before the transport — tune go-redis PoolSize.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 89
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_client_pool_timeouts_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} timeouts/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "title": "Pool hits / misses / stale",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "go-redis pool acquisition outcomes. Hit = reused; miss = new conn opened; stale = idle conn discarded by health check.",
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 89
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_client_pool_hits_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} hits/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_client_pool_misses_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} misses/sec",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_client_pool_stale_conns_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} stale/sec",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 109,
+      "title": "Server-side (redis_exporter sidecar — NOT filtered by Backend type)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 96
+      },
+      "panels": []
+    },
+    {
+      "id": 29,
+      "title": "Memory used vs max",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Server-side memory usage (redis_memory_used_bytes) versus the configured max (redis_memory_max_bytes). When `used` approaches `max`, the next write under `maxmemory-policy` triggers evictions or `OOM command not allowed`. `max=0` means the server has no maxmemory configured (Redis grows until host OOM).",
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_memory_used_bytes{job=\"redis\"}",
+          "legendFormat": "used",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_memory_max_bytes{job=\"redis\"}",
+          "legendFormat": "max",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "title": "Evictions / rejected connections",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Evictions/sec = keys dropped by `maxmemory-policy` (LRU/LFU). Rejected/sec = clients turned away because `maxclients` was reached. Either signal correlates with hub-side dispatch p99 spikes; helps disambiguate transport-layer pressure from server-layer pressure.",
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_evicted_keys_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "evictions/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_rejected_connections_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "rejected/sec",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 31,
+      "title": "Commands per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Server-side command throughput (`info commandstats` aggregate). Hub publish/dispatch volume should track this — large divergence indicates a non-hub Redis client (operator session, exporter, or a second hub on the same instance).",
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_commands_processed_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "commands/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "title": "Connected clients",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Total clients on the Redis instance. Compare against the hub's `mercure_redis_client_pool_total_conns` (one line per hub replica — sum them mentally for the fleet-wide pool footprint) plus the Redis Exporter itself (~1 persistent connection) and any operator sessions. Sudden drops correlate with network blips or `maxclients` saturation.",
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 97
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_connected_clients{job=\"redis\"}",
+          "legendFormat": "clients",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "title": "Keyspace hit ratio",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "hits / (hits + misses). Streams (XADD/XREADGROUP) don't drive keyspace_hits/misses — only the presence GET/SCAN reads and the `:lastEventID` GET do. Sustained low ratio under steady load can indicate presence-key churn faster than `presence_ttl` (writes are SET-with-EX, one-shot — no separate EXPIRE).",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_keyspace_hits_total{job=\"redis\"}[$__rate_interval]) / clamp_min(rate(redis_keyspace_hits_total{job=\"redis\"}[$__rate_interval]) + rate(redis_keyspace_misses_total{job=\"redis\"}[$__rate_interval]), 1e-9)",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "title": "Slow log length",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Current entries in `SLOWLOG` (commands above `slowlog-log-slower-than` µs). Growing length means commands are crossing the slow threshold — often Lua publish, large XRANGE history replays, or contended SCAN passes. Pair with hub-side dispatch p99 to triage.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_slowlog_length{job=\"redis\"}",
+          "legendFormat": "slowlog entries",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 35,
+      "title": "Network throughput",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Bytes/sec read from and written to clients by the Redis server. Pair against hub-side dispatch throughput to spot fan-out amplification (output » input is normal during fan-out; sustained input bursts often track publish storms).",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 111
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_net_input_bytes_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "input",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_net_output_bytes_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "output",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 36,
+      "title": "CPU usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "CPU seconds per wall-clock second consumed by the Redis server. Default Redis is single-threaded — 100% (one core) on `user` is full saturation; with `io-threads N` enabled the saturation point scales by N. `user` is application work (publish Lua, XREADGROUP, XADD); `sys` is kernel time (network, I/O). Sustained 70%+ on a single-threaded server (or 70% × `io-threads` count) means Redis is the bottleneck — correlate with publish/dispatch p99 spikes.",
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 111
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_cpu_user_seconds_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "user",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "rate(redis_cpu_sys_seconds_total{job=\"redis\"}[$__rate_interval])",
+          "legendFormat": "sys",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "min": 0,
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "title": "Top 5 commands by avg latency",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Per-command average latency in seconds. Sourced from Redis `INFO commandstats` (cmdstat_*). Watch `evalsha` for Lua publish slowdowns and `xrange`/`xreadgroup` for history-replay or listener stalls. Note: `topk` is evaluated per scrape step, so the legend over a long window is the union of step-level top-5 sets — multi-select to focus.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 118
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(5, rate(redis_commands_duration_seconds_total{job=\"redis\"}[$__rate_interval]) / clamp_min(rate(redis_commands_total{job=\"redis\"}[$__rate_interval]), 1e-9))",
+          "legendFormat": "{{cmd}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 38,
+      "title": "Memory fragmentation",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "RSS / used ratio. 1.0 = no fragmentation. ~1.0–1.5 is normal steady state. Sustained > 1.5 with churn is allocator fragmentation pressure (rapid alloc/free of variably-sized stream entries during load tests). Combined with `redis_memory_used_rss_bytes` for the absolute RSS overshoot relative to `redis_memory_used_bytes` — sets the headroom needed beyond `maxmemory` to avoid OS-level OOM.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 126
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_mem_fragmentation_ratio{job=\"redis\"}",
+          "legendFormat": "ratio (rss/used)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "redis_memory_used_rss_bytes{job=\"redis\"} - redis_memory_used_bytes{job=\"redis\"}",
+          "legendFormat": "rss overshoot (bytes)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rss overshoot (bytes)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 110,
+      "title": "Adoption & retention signals",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 133
+      },
+      "panels": []
+    },
+    {
+      "id": 41,
+      "title": "Consumer groups attached to stream",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Number of consumer groups on the stream (XINFO GROUPS length, one group per hub instance plus any zombies not yet GC'd). Gates the misconfiguration alert: publishes succeed but no hub reads (groups == 0 while publish_rate > 0). Sentinel -1 means XINFO returned an error — distinct from 'Redis returned zero groups'.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 134
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (mercure_redis_consumer_groups{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} groups",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepBefore",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "min", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "title": "Available history window",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Wall-clock seconds between the stream's first and last entries (Redis-stamped <ms>-<seq>). Proactive companion to `history_replay_fallback_total`: alert when this falls below the expected client reconnect duration to catch retention-too-tight regressions BEFORE clients miss on reconnect. 0 on empty stream, -1 if entry IDs cannot be parsed.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 134
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max by (instance, backend_type) (mercure_redis_history_window_seconds{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} | {{backend_type}} window",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "min", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 43,
+      "title": "Zero-match dispatch rate (fan-out without consumers)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Rate of XREADGROUP'd events that fanned out to zero local subscribers on this replica. Fleet-wide cost is this rate × replica count. Sustained non-zero often points at a publisher emitting to dead topics (heartbeats with no debug UI attached, retired subscription IDs, etc.).",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 134
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_dispatch_zero_match_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} zero-match/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": ["lastNotNull", "mean", "max"]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 44,
+      "title": "Per-instance p99 outliers (min 100 samples/window)",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Companion to the fleet-aggregate histogram panels above. Each row is a {instance, metric} pair whose sample count over the dashboard's `$__rate_interval` exceeds 100 (`increase(_count[$__rate_interval]) > 100`) — the minimum for stable p99 inference. Without this gate, low-traffic replicas would publish NaN-or-misleading p99s and dominate the top-K. Sort by Value column to find replicas drifting from fleet median. Use $instance template to drill into a specific replica's full histograms above.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 142
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_dispatch_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_dispatch_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"dispatch_duration\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | dispatch",
+          "refId": "A",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_xreadgroup_latency_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_xreadgroup_latency_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"xreadgroup_latency\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | xreadgroup",
+          "refId": "B",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_history_replay_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_history_replay_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"history_replay_duration\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | history_replay",
+          "refId": "C",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_publish_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_publish_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"publish_duration\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | publish",
+          "refId": "D",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_add_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_add_subscriber_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"add_subscriber_duration\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | add_subscriber",
+          "refId": "E",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(histogram_quantile(0.99, sum by (instance, backend_type, le) (rate(mercure_redis_remove_subscriber_duration_seconds_bucket{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))) and on (instance, backend_type) (sum by (instance, backend_type) (increase(mercure_redis_remove_subscriber_duration_seconds_count{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval])) > 100), \"metric\", \"remove_subscriber_duration\", \"__name__\", \".*\")",
+          "legendFormat": "{{instance}} | {{backend_type}} | remove_subscriber",
+          "refId": "F",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.05
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      }
+    },
+    {
+      "id": 111,
+      "title": "Subscribers shed by admission gate (rate/sec)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "New subscribers shed by the admission gate, by reason (rate = over the per-task accept-rate token bucket; capacity = over the concurrent-count ceiling). Non-zero = the hub is returning 429 at the front door. Headline signal for subscriber_rate_limit / subscriber_max_count.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 152
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type, reason) (rate(mercure_redis_subscriber_admission_rejected_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "sum",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 112,
+      "title": "Presence reads capped (rate/sec)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "GetSubscribers calls refused (503) because the subscriber count exceeded subscriptions_max_subscribers — the presence-read memory guard. Non-zero = presence reads are being capped to protect task memory.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 152
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance, backend_type) (rate(mercure_redis_presence_read_capped_total{job=~\"$job\",backend_type=~\"$backend_type\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} | {{backend_type}} capped/sec",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "mercure",
+    "redistransport",
+    "redis",
+    "sse"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "description": "Prometheus datasource (matches the uid provisioned by `redistransport/grafana/datasources.yml`). Required so the dashboard imports cleanly into Grafana instances whose Prometheus datasource has a different uid.",
+        "label": "Data source",
+        "regex": "",
+        "hide": 0,
+        "current": {
+          "selected": false,
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "refresh": 1,
+        "skipUrlSync": false
+      },
+      {
+        "name": "job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "description": "Prometheus scrape job for Mercure hub instances, sourced from `mercure_redis_build_info`. If empty, the hub is not being scraped — check Prometheus targets, not this dashboard.",
+        "definition": "label_values(mercure_redis_build_info, job)",
+        "query": {
+          "query": "label_values(mercure_redis_build_info, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "Job",
+        "hide": 0,
+        "skipUrlSync": false,
+        "sort": 1
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "description": "Hub pod/replica identifier (Prometheus `instance` label). Use to scope panels to a single replica during incident triage; leave on `All` for fleet-wide views.",
+        "definition": "label_values(mercure_redis_build_info{job=~\"$job\"}, instance)",
+        "query": {
+          "query": "label_values(mercure_redis_build_info{job=~\"$job\"}, instance)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "Instance",
+        "hide": 0,
+        "skipUrlSync": false,
+        "sort": 1
+      },
+      {
+        "name": "backend_type",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "description": "Detected backend server family (redis/valkey/unknown) sourced from `mercure_redis_build_info`. If empty, either the metric is not being scraped, OR the selected `$instance` runs Bolt/Local (no redistransport) — check Prometheus targets first, then check the transport in use.",
+        "definition": "label_values(mercure_redis_build_info{job=~\"$job\"}, backend_type)",
+        "query": {
+          "query": "label_values(mercure_redis_build_info{job=~\"$job\"}, backend_type)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "label": "Backend type",
+        "hide": 0,
+        "skipUrlSync": false,
+        "sort": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Mercure Redis Transport",
+  "uid": "mercure-redis-transport",
+  "version": 7,
+  "weekStart": ""
+}

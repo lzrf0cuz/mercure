@@ -1,0 +1,122 @@
+# Hub observability stack — Prometheus + Grafana (always-on) + Jaeger
+# (opt-in via `tracing` profile) — included by the root compose.yaml.
+# Prom/Grafana are always-on because the hub dev loop expects metrics +
+# dashboards by default; the redistransport variant gates the same
+# behind a `metrics` profile because the transport dev loop is leaner
+# (intentional asymmetry, not drift).
+#
+# Jaeger is profile-gated because:
+#   - tracing is opt-in at the Caddyfile level too (operator must add
+#     the `tracing` directive — see docs/hub/tracing.md), so always-on
+#     Jaeger would idle with no spans for most operators
+#   - jaegertracing/all-in-one is ~80 MB; not worth pulling for ops
+#     who don't enable the Caddyfile directive
+#
+# Mutual exclusion with redistransport/compose.observability.yaml:
+#   - Container names `prometheus`, `grafana`, `jaeger` and ports 9090 /
+#     3000 / 16686 / 4317 / 4318 are identical (container_name is
+#     daemon-global, ports are host-global). Run one stack or the other,
+#     not both — `tracing:up` here while the Redis stack's Jaeger
+#     (dev:full:tracing) is up fails with a name/port clash.
+#
+# Scrape target: the Mercure hub running in this Compose project at
+# `mercure:9091` (in-network DNS). The redistransport variant scrapes
+# `host.docker.internal:9091` because the transport dev loop runs the
+# hub natively on the host.
+
+services:
+  prometheus:
+    container_name: prometheus
+    image: ${PROMETHEUS_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      mercure:
+        condition: service_healthy
+
+  grafana:
+    container_name: grafana
+    image: ${GRAFANA_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # Grafana 12.x deprecated non-Viewer anonymous roles; only Viewer is
+      # supported. Sign in as admin/admin (above) for the few cases that
+      # need edit/save (panel tweaks, datasource changes, etc.).
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # Disable the public-plugin-registry poll (every 10 min in Grafana
+      # default). Dev stack is offline-first and the background call pollutes
+      # the docker logs grep with a flag-eval INFO line per cycle. The
+      # Grafana setting is `[analytics] check_for_plugin_updates`, so the
+      # env-var override is GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES (NOT the
+      # plausible-but-wrong GF_PLUGINS_UPDATES_CHECK_ENABLED — Grafana
+      # silently ignores undocumented envs).
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      # Also silence the upstream-stats reporter (separate from the plugin
+      # update poll above). It fails noisily when optional plugins
+      # (amazonprometheus-datasource) and APIs (advisor) are absent, and we
+      # don't want grafana.com to receive dev-loop telemetry. Maps to the
+      # `[analytics] reporting_enabled` setting.
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:3000/api/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # Jaeger all-in-one: OTLP receiver + storage + web UI in one container.
+  # Profile-gated (see header for rationale). The mercure service exports
+  # spans via OTLP gRPC to jaeger:4317 when the Caddyfile enables the
+  # `tracing` directive — see docs/hub/tracing.md.
+  jaeger:
+    profiles: ["tracing"]
+    container_name: jaeger
+    image: ${JAEGER_IMAGE}
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "127.0.0.1:16686:16686"  # web UI — http://localhost:16686
+      - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
+      - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+    healthcheck:
+      # 14269 is Jaeger all-in-one's admin/health port (not 16686 the UI, not
+      # 4317/4318 OTLP). If you swap to jaeger-v2 / a split collector image,
+      # this port changes.
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:14269/ || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 30s (vs 10s for prometheus/grafana) — jaegertracing/all-in-one:1.62.0
+      # cold-pull regularly takes 15-25s before :14269 answers; 10s leaves it
+      # transiently `unhealthy` on first boot. Nothing `depends_on` jaeger
+      # being healthy so this is cosmetic for the dev workflow; the longer
+      # window keeps the `unhealthy` status from misrepresenting normal
+      # cold-start latency.
+      start_period: 30s
+
+volumes:
+  prometheus_data:
+  grafana_data:

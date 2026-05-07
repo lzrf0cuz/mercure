@@ -67,23 +67,25 @@ func TestVersionMetricsCollectorInitialization(t *testing.T) {
 	var metricOut dto.Metric
 
 	v := AppVersionInfo{
-		Version:      "1.0.0",
-		BuildDate:    "2020-05-03T18:42:44Z",
-		Commit:       "96ee2b9",
-		GoVersion:    "go1.14.2",
-		OS:           "linux",
-		Architecture: "amd64",
+		Version:         "1.0.0",
+		BuildDate:       "2020-05-03T18:42:44Z",
+		Commit:          "96ee2b9",
+		GoVersion:       "go1.14.2",
+		OS:              "linux",
+		Architecture:    "amd64",
+		UpstreamVersion: "v0.23.5",
 	}
 
 	c := v.NewMetricsCollector()
 
 	labelValues := map[string]string{
-		"version":      v.Version,
-		"built_at":     v.BuildDate,
-		"commit":       v.Commit,
-		"go_version":   v.GoVersion,
-		"os":           v.OS,
-		"architecture": v.Architecture,
+		"version":          v.Version,
+		"built_at":         v.BuildDate,
+		"commit":           v.Commit,
+		"go_version":       v.GoVersion,
+		"os":               v.OS,
+		"architecture":     v.Architecture,
+		"upstream_version": v.UpstreamVersion,
 	}
 
 	m, err := c.GetMetricWith(labelValues)

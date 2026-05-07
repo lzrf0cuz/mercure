@@ -1,0 +1,127 @@
+# Shared RedisInsight service definition.
+#
+# Included by both compose.redis.yaml and compose.valkey.yaml via Compose's
+# `include:` keyword (Compose v2.20+) so the UI is available in both dev
+# stacks without duplicating the service definition.
+#
+# RedisInsight is wire-protocol compatible with both Redis and Valkey. The
+# Stack/Search/JSON panels rely on Redis modules (RediSearch, RedisJSON,
+# etc.) that aren't in vanilla Valkey — for the redistransport dev loop
+# (browsing the mercure stream, presence keys, last-event-ID) the core
+# panels are sufficient against either backend.
+#
+# The bootstrap sidecar registers a database connection via the RedisInsight
+# API once the UI is healthy, so the first-launch "Add database" step is
+# skipped. Per-stack overrides set REDISINSIGHT_BACKEND_HOST/NAME (compose.
+# redis.yaml -> redis / "Local Redis"; compose.valkey.yaml -> valkey /
+# "Local Valkey"). RI_REDIS_HOST env-var pre-seeding is NOT honored by
+# RedisInsight 3.4.2 (verified) — the API path is the supported route.
+#
+# Mutual exclusion: the redis and valkey stacks share port 5540 (UI) and
+# port 6379 (backend). Run one stack at a time — `docker compose down`
+# the other first.
+
+services:
+  redisinsight:
+    container_name: mercure-redisinsight
+    image: ${REDISINSIGHT_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5540:5540"
+    environment:
+      # Accept connections from localhost (required for browser access)
+      - RITRUSTEDORIGINS=http://localhost:5540
+    healthcheck:
+      # RedisInsight image has no wget/curl — use built-in node for health checks.
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5540/api/health',r=>{process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    volumes:
+      - redisinsight_data:/data
+
+  # One-shot bootstrap: POST a database connection to the RedisInsight API
+  # so the UI lands on the Browser view instead of the empty database list.
+  # Idempotent — checks for an existing connection to the same host before
+  # POSTing. Per-stack overrides supply REDISINSIGHT_BACKEND_HOST/NAME.
+  redisinsight-bootstrap:
+    container_name: mercure-redisinsight-bootstrap
+    image: ${CURL_IMAGE}
+    restart: "no"
+    depends_on:
+      redisinsight:
+        condition: service_healthy
+    environment:
+      BACKEND_HOST: ${REDISINSIGHT_BACKEND_HOST:-redis}
+      BACKEND_NAME: ${REDISINSIGHT_BACKEND_NAME:-Local Redis}
+      # Slow CI (cold image pull, ARM emulation) may need >30s for
+      # RedisInsight to respond on /api/health. Override with
+      # REDISINSIGHT_BOOTSTRAP_TIMEOUT=N at the compose-up call site.
+      BOOTSTRAP_TIMEOUT: ${REDISINSIGHT_BOOTSTRAP_TIMEOUT:-30}
+    command:
+      - /bin/sh
+      - -euc
+      - |
+        # pipefail makes `curl ... | grep` propagate curl's exit code,
+        # closing the silent-failure path where a transient curl 5xx would
+        # otherwise let grep's "no match" decision drive the script into
+        # POSTing against a degraded API.
+        set -o pipefail
+
+        # Poll /api/health silently to handle `compose restart` (which
+        # doesn't re-evaluate depends_on:service_healthy). On `compose up`
+        # the depends_on gate makes this a single iteration. Stderr is
+        # suppressed during the wait so transient retry noise doesn't reach
+        # the operator; the final-attempt failure message is explicit.
+        i=0
+        until curl -fsS http://redisinsight:5540/api/health >/dev/null 2>&1; do
+          i=$$((i + 1))
+          if [ $$i -ge $$BOOTSTRAP_TIMEOUT ]; then
+            echo "[bootstrap] RedisInsight /api/health not reachable after $${BOOTSTRAP_TIMEOUT}s" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+
+        # Accept the EULA via API. Without this, RedisInsight blocks the UI
+        # behind a first-launch agreements dialog AND leaves the encryption
+        # strategy uninitialized — POSTed databases are listable but the
+        # /keys API returns 500 UnsupportedEncryptionStrategy when the UI
+        # tries to use them. We pull the version from /api/settings/agreements/spec
+        # so a RedisInsight upgrade that bumps the agreements version
+        # doesn't silently re-strand operators behind the dialog.
+        # encryption=false is correct for a Docker container (no system
+        # keychain); analytics+notifications=false keeps the dev stack
+        # offline-friendly.
+        AGREEMENTS_VERSION=$$(curl -fsS http://redisinsight:5540/api/settings/agreements/spec \
+          | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -1)
+        if [ -z "$$AGREEMENTS_VERSION" ]; then
+          echo "[bootstrap] RedisInsight: failed to read agreements version" >&2
+          exit 1
+        fi
+        curl -fsS -o /dev/null -X PATCH http://redisinsight:5540/api/settings \
+          -H 'Content-Type: application/json' \
+          -d "{\"agreements\":{\"version\":\"$$AGREEMENTS_VERSION\",\"eula\":true,\"analytics\":false,\"notifications\":false,\"encryption\":false}}"
+        echo "[bootstrap] RedisInsight: EULA v$$AGREEMENTS_VERSION accepted (analytics+notifications=off, encryption=off)"
+
+        # Idempotent registration. The grep regex tolerates "host": "redis"
+        # with arbitrary whitespace after the colon — RedisInsight 3.4.2
+        # emits compact JSON, but a future version change should not
+        # silently double-register.
+        if curl -fsS http://redisinsight:5540/api/databases \
+            | grep -Eq "\"host\"[[:space:]]*:[[:space:]]*\"$$BACKEND_HOST\""; then
+          echo "[bootstrap] RedisInsight already has connection for $$BACKEND_HOST"
+          exit 0
+        fi
+        if curl -fsS -o /dev/null -X POST http://redisinsight:5540/api/databases \
+            -H 'Content-Type: application/json' \
+            -d "{\"name\":\"$$BACKEND_NAME\",\"host\":\"$$BACKEND_HOST\",\"port\":6379}"; then
+          echo "[bootstrap] RedisInsight: added $$BACKEND_NAME ($$BACKEND_HOST:6379)"
+        else
+          echo "[bootstrap] RedisInsight: POST /api/databases failed" >&2
+          exit 1
+        fi
+
+volumes:
+  redisinsight_data:

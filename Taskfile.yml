@@ -1,0 +1,1751 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+# https://taskfile.dev
+# Install: brew install go-task
+# Usage: task <taskname> or task --list
+#
+# Mercure Hub (lzrf0cuz fork) — SSE notification streaming.
+# Generic dev-loop + image build / compose lifecycle. No registry push tasks
+# are wired in — release pipelines live downstream of this fork.
+#
+# Caddyfile Configurations bundled in the image:
+#   - local.Caddyfile: Local development (direct TLS)
+#   - Caddyfile:       Production (direct TLS, no fronting load balancer)
+#
+# Override examples:
+#   task up CADDYFILE=Caddyfile ENV_FILE=.env.prod
+#
+# For reverse-proxy / load-balancer fronted deploys, downstream consumers layer
+# their own Caddyfiles on this image via `COPY --from=source`.
+
+version: '3'
+
+output: prefixed
+method: checksum
+silent: true
+dotenv: ['.env.local', '.env.dev']
+
+vars:
+  # Application
+  SVC_NAME: mercure
+  SVC_VERSION: v0.0.1
+  UPSTREAM_VERSION: v0.24.2
+  # In-tree redistransport module version. Independent from SVC_VERSION
+  # because the transport is its own Go module with its own release
+  # cadence. Bumped via `task version:bump:rt:*`.
+  RT_VERSION: v0.0.1
+  # Permissive vX.Y.Z[-suffix] form shared by version:set / version:set:rt /
+  # release:* tasks. Leading `v` is REQUIRED (Go module proxy resolves
+  # only `v`-prefixed tags). NOT strict SemVer — accepts some odd suffixes
+  # like `v1.2.3-+foo`. Sufficient for tag-name validation; release tasks
+  # also gate on V == SVC_VERSION / RT_VERSION which catches typos.
+  TAG_VERSION_REGEX: '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$'
+  # Used in shell substitutions only. Tasks that need to `cd` into the
+  # Caddy module directory should NOT use this var — they should hard-
+  # code `dir: caddy/mercure` because Task v3's `dir:` field doesn't
+  # expand `{{.TASKFILE_DIR}}` at var-definition time, leaving the
+  # relative form to be resolved at the wrong base.
+  CADDY_DIR: caddy/{{.SVC_NAME}}
+
+  # Go
+  GO_OS:
+    sh: go env GOOS 2>/dev/null || echo "darwin"
+  GO_ARCH:
+    sh: go env GOARCH 2>/dev/null || echo "amd64"
+  GO_BUILD_TAGS: deprecated_server,deprecated_transport,nobadger,nomysql,nopgx
+  GO_LDFLAGS: >-
+    -X 'github.com/caddyserver/caddy/v2.CustomVersion=Mercure {{.SVC_VERSION}} (upstream {{.UPSTREAM_VERSION}}) Caddy'
+    -X 'github.com/caddyserver/caddy/v2/modules/caddyhttp.ServerHeader=Mercure {{.SVC_VERSION}} (upstream {{.UPSTREAM_VERSION}})'
+    -X 'github.com/dunglas/mercure/common.version={{.SVC_VERSION}}'
+    -X 'github.com/dunglas/mercure/common.upstreamVersion={{.UPSTREAM_VERSION}}'
+    -X 'github.com/lzrf0cuz/mercure/redistransport.version={{.RT_VERSION}}'
+  BIN_DIR: bin/{{.SVC_VERSION}}
+
+  # Docker — locally-tagged images only. No remote registry push from the
+  # fork; release-to-registry is handled by downstream consumers.
+  DOCKER_OS: linux
+  # Pinned to specific patch tags so `task up:build` is reproducible across
+  # workstations; bump in lock-step with caddy/go.mod for BASE_IMAGE.
+  BUILD_IMAGE: golang:1.26.2-alpine
+  BASE_IMAGE: caddy:2.11.4-alpine
+  IMAGE_TAG: "{{.SVC_VERSION}}-{{.DOCKER_OS}}-{{.GO_ARCH}}"
+  IMAGE_REPO: "{{.SVC_NAME}}"
+  SVC_IMAGE: "{{.IMAGE_REPO}}:{{.IMAGE_TAG}}"
+
+  # Observability image pins (SSOT) — compose.observability.yaml references these
+  # via the env block below, so every image version lives in one place.
+  PROMETHEUS_IMAGE: prom/prometheus:v3.11.3
+  GRAFANA_IMAGE: grafana/grafana:12.4.3
+  JAEGER_IMAGE: jaegertracing/all-in-one:1.62.0
+
+  # Container
+  CONTAINER_NAME: mercure
+  # Caddyfile: local.Caddyfile (local dev) or Caddyfile (prod direct)
+  CADDYFILE: local.Caddyfile
+  # Env file: .env.dev (local) or .env.prod (production — copy from .env.prod.template)
+  ENV_FILE: .env.dev
+
+  # URLs
+  MERCURE_UI: https://localhost/.well-known/mercure/ui/
+  MERCURE_HTTP_UI: http://localhost/.well-known/mercure/ui/
+  METRICS_URL: http://localhost:9091/metrics
+  PROMETHEUS_URL: http://localhost:9090
+  GRAFANA_URL: http://localhost:3000
+  REDISINSIGHT_URL: http://localhost:5540
+  JAEGER_URL: http://localhost:16686
+
+env:
+  # Docker Compose environment
+  SVC_BUILD_IMAGE: "{{.BUILD_IMAGE}}"
+  SVC_BASE_IMAGE: "{{.BASE_IMAGE}}"
+  SVC_IMAGE: "{{.SVC_IMAGE}}"
+  SVC_VERSION: "{{.SVC_VERSION}}"
+  UPSTREAM_VERSION: "{{.UPSTREAM_VERSION}}"
+  RT_VERSION: "{{.RT_VERSION}}"
+  PLATFORM: "{{.DOCKER_OS}}/{{.GO_ARCH}}"
+  CADDYFILE: "{{.CADDYFILE}}"
+  ENV_FILE: "{{.ENV_FILE}}"
+  # Observability image pins → compose.observability.yaml references these.
+  PROMETHEUS_IMAGE: "{{.PROMETHEUS_IMAGE}}"
+  GRAFANA_IMAGE: "{{.GRAFANA_IMAGE}}"
+  JAEGER_IMAGE: "{{.JAEGER_IMAGE}}"
+
+# Namespace redistransport tasks under "rt:*" so they're reachable from the root
+# (e.g., `task rt:test`, `task rt:lint`, `task rt:redis:up`, `task rt:valkey:up`,
+# `task rt:conformance`) without duplicating logic. Transport-specific tasks
+# live in redistransport/Taskfile.yml — do NOT re-declare them here.
+includes:
+  rt:
+    taskfile: ./redistransport/Taskfile.yml
+    dir: ./redistransport
+    optional: true
+
+tasks:
+  # ============================================
+  # Default
+  # ============================================
+  default:
+    cmds:
+      - task --list
+
+  # ============================================
+  # Development (quick start, local workflow)
+  # ============================================
+  dev:
+    desc: Start Mercure in dev mode with log following
+    cmds:
+      - task: up:detach
+      - sleep 2
+      - task: logs
+
+  open:
+    desc: Open Mercure debug UI in browser (HTTPS)
+    cmds:
+      - open {{.MERCURE_UI}}
+
+  open:http:
+    desc: Open Mercure debug UI in browser (HTTP)
+    cmds:
+      - open {{.MERCURE_HTTP_UI}}
+
+  open:grafana:
+    desc: Open Grafana home in browser (run `task rt:metrics:up:redis` first)
+    cmds:
+      - open {{.GRAFANA_URL}}
+
+  open:prometheus:
+    desc: Open Prometheus UI in browser (run `task rt:metrics:up:redis` first)
+    cmds:
+      - open {{.PROMETHEUS_URL}}
+
+  open:jaeger:
+    desc: Open Jaeger UI in browser (run `task dev:full:tracing` for the Redis loop, or `task tracing:up` for the root hub stack, first)
+    cmds:
+      - open {{.JAEGER_URL}}
+
+  open:dashboard:hub:
+    desc: Open the Mercure Hub Grafana dashboard directly
+    cmds:
+      - open {{.GRAFANA_URL}}/d/mercure-hub
+
+  open:dashboard:transport:
+    desc: Open the Mercure Redis Transport Grafana dashboard directly
+    cmds:
+      - open {{.GRAFANA_URL}}/d/mercure-redis-transport
+
+  open:dashboard:
+    desc: Open both Grafana dashboards (hub + transport) in new tabs
+    cmds:
+      - task: open:dashboard:hub
+      - task: open:dashboard:transport
+
+  open:dev:
+    desc: Open Mercure debug UI + RedisInsight tabs (run `task dev:redis` first)
+    cmds:
+      - open {{.MERCURE_UI}}
+      - open {{.REDISINSIGHT_URL}}
+
+  open:dev:full:
+    # `task dev:full` and `task tracing:up` use SEPARATE compose stacks that
+    # both bind 127.0.0.1:3000:3000 (Grafana) and reuse container names —
+    # they cannot run simultaneously. Pick one observability stack:
+    #   * `task dev:full` → rt observability (Prometheus + rt-side Grafana +
+    #     redis_exporter). Add `task tracing:up` ONLY after `task dev:full`'s
+    #     stack is torn down (rt:metrics:down:redis), and vice versa.
+    # This task assumes the rt observability path. Use `open:jaeger`
+    # separately when the tracing stack is the one that's up.
+    desc: Mercure + RedisInsight + rt Grafana — run `task dev:full` first (rt observability stack)
+    cmds:
+      - open {{.MERCURE_UI}}
+      - open {{.REDISINSIGHT_URL}}
+      - open {{.GRAFANA_URL}}
+
+  tls:trust:
+    desc: Install Caddy root certificate (local binary)
+    vars:
+      CERT_PATH: $HOME/Library/Application Support/Caddy/pki/authorities/local/root.crt
+      HASH_FILE: $HOME/.caddy-trust-local-sha1
+      OTHER_HASH_FILE: $HOME/.caddy-trust-docker-sha1
+      KEYCHAIN: ~/Library/Keychains/login.keychain-db
+    preconditions:
+      - sh: test -f "$HOME/Library/Application Support/Caddy/pki/authorities/local/root.crt"
+        msg: "Caddy root CA not found. Run 'task go:run' at least once to generate it."
+    cmds:
+      - |
+        set -eu
+        NEW_HASH=$(openssl x509 -in "{{.CERT_PATH}}" -noout -fingerprint -sha1 | sed 's/.*=//' | tr -d ':')
+        if [ -f "{{.HASH_FILE}}" ] && [ "$(cat "{{.HASH_FILE}}")" = "$NEW_HASH" ]; then
+          echo "[tls:trust] Certificate unchanged, skipping keychain update."
+          exit 0
+        fi
+        # Remove old cert if tracked
+        if [ -f "{{.HASH_FILE}}" ]; then
+          security delete-certificate -Z "$(cat "{{.HASH_FILE}}")" -t {{.KEYCHAIN}} 2>/dev/null || true
+        elif security find-certificate -c "Caddy Local Authority" {{.KEYCHAIN}} >/dev/null 2>&1; then
+          TOTAL=$(security find-certificate -a -c "Caddy Local Authority" -Z {{.KEYCHAIN}} | grep -c "SHA-1" || echo 0)
+          TRACKED=0
+          [ -f "{{.OTHER_HASH_FILE}}" ] && TRACKED=1
+          if [ "$TOTAL" -gt "$TRACKED" ]; then
+            echo "ERROR: Found $TOTAL Caddy cert(s) in keychain but only $TRACKED tracked by sibling task."
+            echo "No tracking file at {{.HASH_FILE}}."
+            echo "Delete orphaned Caddy certs in Keychain Access, then re-run."
+            exit 1
+          fi
+        fi
+        # Add new cert and record its hash ONLY if the add succeeds — so a
+        # headless / locked-keychain failure (no GUI auth) doesn't leave a
+        # tracking file claiming a cert is trusted when it isn't.
+        if security add-trusted-cert -r trustRoot -k {{.KEYCHAIN}} "{{.CERT_PATH}}"; then
+          echo "$NEW_HASH" > "{{.HASH_FILE}}"
+          echo "[tls:trust] Done. Local Caddy root CA is now trusted in login keychain."
+        else
+          echo "[tls:trust] Could not add trust setting (headless or locked keychain?). Run from a GUI session if needed."
+        fi
+
+  tls:trust:docker:
+    desc: Trust the Docker container's Caddy root certificate
+    vars:
+      HASH_FILE: $HOME/.caddy-trust-docker-sha1
+      OTHER_HASH_FILE: $HOME/.caddy-trust-local-sha1
+      KEYCHAIN: ~/Library/Keychains/login.keychain-db
+    preconditions:
+      - sh: docker inspect mercure > /dev/null 2>&1
+        msg: "Mercure container not running. Start with: task up:detach"
+    cmds:
+      # Clear any stale copy from a prior run so a failed docker cp can't leave
+      # the next block trusting/hashing an old cert.
+      - rm -f /tmp/mercure-docker-root.crt
+      - docker cp mercure:/data/caddy/pki/authorities/local/root.crt /tmp/mercure-docker-root.crt
+      - |
+        set -eu
+        NEW_HASH=$(openssl x509 -in /tmp/mercure-docker-root.crt -noout -fingerprint -sha1 | sed 's/.*=//' | tr -d ':')
+        if [ -f "{{.HASH_FILE}}" ] && [ "$(cat "{{.HASH_FILE}}")" = "$NEW_HASH" ]; then
+          echo "[tls:trust:docker] Certificate unchanged, skipping keychain update."
+          rm /tmp/mercure-docker-root.crt
+          exit 0
+        fi
+        # Remove old cert if tracked
+        if [ -f "{{.HASH_FILE}}" ]; then
+          security delete-certificate -Z "$(cat "{{.HASH_FILE}}")" -t {{.KEYCHAIN}} 2>/dev/null || true
+        elif security find-certificate -c "Caddy Local Authority" {{.KEYCHAIN}} >/dev/null 2>&1; then
+          TOTAL=$(security find-certificate -a -c "Caddy Local Authority" -Z {{.KEYCHAIN}} | grep -c "SHA-1" || echo 0)
+          TRACKED=0
+          [ -f "{{.OTHER_HASH_FILE}}" ] && TRACKED=1
+          if [ "$TOTAL" -gt "$TRACKED" ]; then
+            echo "ERROR: Found $TOTAL Caddy cert(s) in keychain but only $TRACKED tracked by sibling task."
+            echo "No tracking file at {{.HASH_FILE}}."
+            echo "Delete orphaned Caddy certs in Keychain Access, then re-run."
+            rm /tmp/mercure-docker-root.crt
+            exit 1
+          fi
+        fi
+        # Add new cert and record its hash ONLY if the add succeeds (see tls:trust).
+        if security add-trusted-cert -r trustRoot -k {{.KEYCHAIN}} /tmp/mercure-docker-root.crt; then
+          echo "$NEW_HASH" > "{{.HASH_FILE}}"
+          echo "[tls:trust:docker] Done. Docker Caddy root CA is now trusted in login keychain."
+        else
+          echo "[tls:trust:docker] Could not add trust setting (headless or locked keychain?). Run from a GUI session if needed."
+        fi
+        rm -f /tmp/mercure-docker-root.crt
+
+  doctor:
+    desc: System health check — Docker, Go, env files, module deps, TLS cert
+    cmds:
+      - |
+        ok=0
+        fail=0
+        # $1 = label, $2 = test command, $3 = fix instruction.
+        # Captures stderr so failed checks surface the real reason
+        # (e.g. proxy/auth errors from `go mod download`) instead of
+        # silently dropping the diagnostic.
+        check() {
+            local err
+            if err=$(eval "$2" 2>&1 >/dev/null); then
+                printf "  PASS %s\n" "$1"
+                ok=$((ok+1))
+            else
+                printf "  FAIL %s\n      → %s\n" "$1" "$3"
+                if [ -n "$err" ]; then
+                    while IFS= read -r line; do
+                        printf "        %s\n" "$line"
+                    done <<<"$err"
+                fi
+                fail=$((fail+1))
+            fi
+        }
+        printf "\nmercure doctor\n==============\n\n"
+        check "Docker daemon"                "docker info"                            "start Docker Desktop or 'orb start'"
+        check "Go toolchain"                 "command -v go"                          "install Go 1.26+ from https://go.dev/dl"
+        check ".env.dev present"             "test -f .env.dev"                       "git checkout .env.dev (committed via .gitignore '!.env.dev' whitelist)"
+        check ".env.dev.redis present"       "test -f .env.dev.redis"                 "git checkout .env.dev.redis (committed via '!.env.dev.redis' whitelist)"
+        check "hub go.sum present"           "test -s go.sum"                         "go mod download"
+        check "caddy/ go.sum present"        "test -s caddy/go.sum"                   "(cd caddy && go mod download)"
+        check "redistransport/ go.sum"       "test -s redistransport/go.sum"          "(cd redistransport && go mod download)"
+        check "redistransport/caddy/ go.sum" "test -s redistransport/caddy/go.sum"    "(cd redistransport/caddy && go mod download)"
+        check "Caddy local cert trusted"     'test -f "$HOME/.caddy-trust-local-sha1"'  "task go:run (or task dev) once to generate the cert, then task tls:trust"
+        printf "\n  %d ok, %d fail\n\n" "$ok" "$fail"
+        [ "$fail" -eq 0 ]
+
+  # ============================================
+  # Go (source, build, test)
+  # ============================================
+  go:run:
+    desc: Run Mercure locally with hot reload
+    dir: caddy/{{.SVC_NAME}}
+    dotenv: ['../../.env.dev']
+    cmds:
+      - mkdir -p data
+      - go run -ldflags="{{.GO_LDFLAGS}}" -tags={{.GO_BUILD_TAGS}} -race . run -w -c ../../local.Caddyfile
+
+  go:fmt:
+    desc: Format Go source with gofumpt — mutates tree (hub root + caddy submodule)
+    preconditions:
+      - sh: command -v gofumpt >/dev/null
+        msg: "gofumpt not found. Install: go install mvdan.cc/gofumpt@latest"
+    cmds:
+      # Hub root + caddy submodule in a single `find -exec` pass.
+      # redistransport modules are covered by `task rt:fmt`. The
+      # unified walk crosses the `caddy/` go.mod boundary safely
+      # because gofumpt operates per-file under explicit paths.
+      #
+      # `vendor` and `testdata` are pruned explicitly: under
+      # `-exec gofumpt {} +`, paths arrive as file arguments
+      # rather than via gofumpt's own walk, so its built-in
+      # vendor/testdata skip is bypassed. Generated-file
+      # (`Code generated ... DO NOT EDIT.`) skip is per-file and
+      # applies either way.
+      - |
+        set -euo pipefail
+        find . \
+          \( -path ./redistransport -o -path ./bin \
+             -o -name .git -o -name .idea -o -name .vscode \
+             -o -name .task -o -name .mercure -o -name node_modules \
+             -o -name vendor -o -name testdata \) -prune \
+          -o -type f -name '*.go' -exec gofumpt -w {} +
+
+  go:fmt:check:
+    desc: Verify gofumpt formatting — hub root + caddy submodule (CI-safe, non-mutating)
+    preconditions:
+      - sh: command -v gofumpt >/dev/null
+        msg: "gofumpt not found. Install: go install mvdan.cc/gofumpt@latest"
+    cmds:
+      # Same prune set as `go:fmt`.
+      - |
+        set -euo pipefail
+        out=$(find . \
+          \( -path ./redistransport -o -path ./bin \
+             -o -name .git -o -name .idea -o -name .vscode \
+             -o -name .task -o -name .mercure -o -name node_modules \
+             -o -name vendor -o -name testdata \) -prune \
+          -o -type f -name '*.go' -exec gofumpt -l {} +)
+        if [ -n "$out" ]; then
+          printf "Files need formatting (run 'task go:fmt' to fix):\n%s\n" "$out"
+          exit 1
+        fi
+
+  md:lint:
+    desc: Lint Markdown files with rumdl (uses .rumdl.toml)
+    cmds:
+      - rumdl check -c .rumdl.toml .
+
+  md:fmt:
+    desc: Auto-fix Markdown issues with rumdl
+    cmds:
+      - rumdl fmt -c .rumdl.toml .
+
+  sh:lint:
+    desc: Lint shell scripts (shellcheck + shfmt) — local parity with super-linter
+    cmds:
+      - shellcheck release.sh scripts/*.sh tests/*.sh redistransport/scripts/*.sh
+      - shfmt -d release.sh scripts/*.sh tests/*.sh redistransport/scripts/*.sh
+
+  sh:fmt:
+    desc: Auto-format shell scripts with shfmt
+    cmds:
+      - shfmt -w release.sh scripts/*.sh tests/*.sh redistransport/scripts/*.sh
+
+  ui:lint:
+    desc: Lint embedded debug UI JS/CSS (public/) with biome
+    dir: public
+    cmds:
+      - biome lint .
+
+  ui:check:
+    desc: Lint + format check debug UI (CI-safe, non-mutating)
+    dir: public
+    cmds:
+      - biome check .
+
+  ui:fmt:
+    desc: Auto-fix debug UI JS/CSS formatting and lint with biome — mutates tree
+    dir: public
+    cmds:
+      - biome check --write .
+
+  ui:open:
+    desc: Open debug UI in browser (HTTPS, requires running hub)
+    cmds:
+      - open https://mercure.compose.orb.local/.well-known/mercure/ui/
+
+  # Grafana Labs' dashboard-linter, run with `--strict` so findings exit
+  # non-zero. Lints the hub-side dashboard JSON only; the transport
+  # dashboard is linted under `rt:lint:dashboard` (which `task ci`
+  # invokes transitively via `rt:lint:all`). Hub.json runs without a
+  # `.lint` exclusion file — no third-party sidecar panels to exempt.
+  # Install precondition: upstream `go install
+  # github.com/grafana/dashboard-linter@latest` is broken by a `replace`
+  # directive in their go.mod, so the prebuilt release tarball is the
+  # only working install path. Version pinned to v0.1.1 in the install
+  # hint — keep in sync with redistransport/Taskfile.yml's
+  # `lint:dashboard` task when bumping.
+  dashboard:lint:
+    desc: Lint hub Grafana dashboard JSON with grafana/dashboard-linter --strict
+    dir: grafana/dashboards
+    preconditions:
+      - sh: command -v dashboard-linter >/dev/null
+        msg: |
+          dashboard-linter not found. Install (upstream `go install` is broken
+          by a replace directive in their go.mod — use the prebuilt release):
+
+            mkdir -p "$(go env GOPATH)/bin" && curl --fail -sSL \
+              "https://github.com/grafana/dashboard-linter/releases/download/v0.1.1/dashboard-linter_0.1.1_$(uname -s | tr A-Z a-z)_$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/').tar.gz" \
+              | tar -xz -C "$(go env GOPATH)/bin" dashboard-linter
+    cmds:
+      - dashboard-linter lint --strict hub.json
+      - 'printf "Hub dashboard JSON: clean\n"'
+
+  go:get:
+    desc: Download Go dependencies
+    cmds:
+      - go get ./... && go mod tidy
+
+  go:get:update:
+    desc: Update Go dependencies to latest versions
+    cmds:
+      - go get -u ./... && go mod tidy
+
+  go:build:_:
+    internal: true
+    deps: [version:check:upstream]
+    requires:
+      vars: [TARGET_OS, TARGET_ARCH]
+    dir: caddy/{{.SVC_NAME}}
+    env:
+      GOOS: "{{.TARGET_OS}}"
+      GOARCH: "{{.TARGET_ARCH}}"
+      CGO_ENABLED: "0"
+    vars:
+      OUT_DIR: "../../{{.BIN_DIR}}/{{.TARGET_OS}}-{{.TARGET_ARCH}}"
+    # Incremental skip: rebuild only when any Go source, go.mod/go.sum, or
+    # ldflags-embedded version strings change. Combined with global
+    # `method: checksum`, re-running the task is a no-op when up to date.
+    sources:
+      - "../../**/*.go"
+      - "../../go.mod"
+      - "../../go.sum"
+      - "../../caddy/go.mod"
+      - "../../caddy/go.sum"
+      - "../../redistransport/go.mod"
+      - "../../redistransport/go.sum"
+      - "../../redistransport/caddy/go.mod"
+      - "../../redistransport/caddy/go.sum"
+      - exclude: "../../bin/**"
+      - exclude: "../../.idea/**"
+    generates:
+      - "{{.OUT_DIR}}/mercure"
+    cmds:
+      - mkdir -p {{.OUT_DIR}}
+      - go build -ldflags="{{.GO_LDFLAGS}}" -tags={{.GO_BUILD_TAGS}} -o {{.OUT_DIR}}/mercure
+      - 'echo "Built: {{.BIN_DIR}}/{{.TARGET_OS}}-{{.TARGET_ARCH}}/mercure"'
+
+  go:build:
+    desc: Build Mercure binary for current OS
+    cmds:
+      - task: go:build:_
+        vars: { TARGET_OS: "{{.GO_OS}}", TARGET_ARCH: "{{.GO_ARCH}}" }
+      - '{{.BIN_DIR}}/{{.GO_OS}}-{{.GO_ARCH}}/mercure -v'
+
+  go:build:linux:
+    desc: Build Mercure binary for Linux (current arch)
+    cmds:
+      - task: go:build:_
+        vars: { TARGET_OS: linux, TARGET_ARCH: "{{.GO_ARCH}}" }
+
+  go:build:linux:amd64:
+    desc: Build Mercure binary for Linux x86_64 (amd64)
+    cmds:
+      - task: go:build:_
+        vars: { TARGET_OS: linux, TARGET_ARCH: amd64 }
+
+  go:build:linux:arm64:
+    desc: Build Mercure binary for Linux ARM64
+    cmds:
+      - task: go:build:_
+        vars: { TARGET_OS: linux, TARGET_ARCH: arm64 }
+
+  go:build:darwin:arm64:
+    desc: Build Mercure binary for macOS Apple Silicon
+    cmds:
+      - task: go:build:_
+        vars: { TARGET_OS: darwin, TARGET_ARCH: arm64 }
+
+  go:lint:
+    desc: golangci-lint — hub root + caddy submodule (transport submodules covered by `task rt:lint:all`)
+    preconditions:
+      - sh: command -v golangci-lint >/dev/null
+        msg: "golangci-lint not found. Install: brew install golangci-lint"
+    cmds:
+      - golangci-lint run --build-tags={{.GO_BUILD_TAGS}} ./...
+      - cd caddy && golangci-lint run --build-tags={{.GO_BUILD_TAGS}} ./...
+
+  go:lint:dev:
+    # Default `go:lint` runs without `dev_ui`, which means files tagged
+    # `//go:build dev_ui` (currently `public_fs_dev.go`) are silently
+    # excluded from CI. This task lints with `dev_ui` enabled so the
+    # dev-only path is type-checked + lint-clean too. CI should run both.
+    desc: golangci-lint — hub root with `dev_ui` build tag (covers the unembedded-UI dev path)
+    preconditions:
+      - sh: command -v golangci-lint >/dev/null
+        msg: "golangci-lint not found. Install: brew install golangci-lint"
+    cmds:
+      - golangci-lint run --build-tags={{.GO_BUILD_TAGS}},dev_ui ./...
+
+  go:test:dev:
+    # Pairs with `go:lint:dev`: runs the test suite with `dev_ui` enabled
+    # so the unembedded-UI variant of `publicFS()` is type-checked AND
+    # exercised at runtime. Default `go:test` only runs the embed path.
+    desc: go test — hub root with `dev_ui` build tag (covers the unembedded-UI dev path)
+    cmds:
+      - go test ./... -tags={{.GO_BUILD_TAGS}},dev_ui -race
+
+  go:vet:
+    desc: go vet — hub root + caddy submodule
+    cmds:
+      - go vet -tags={{.GO_BUILD_TAGS}} ./...
+      - cd caddy && go vet -tags={{.GO_BUILD_TAGS}} ./...
+
+  go:vet:dev:
+    # golangci-lint runs a curated govet subset; this exercises
+    # the full analyzer set under `dev_ui`.
+    desc: go vet — hub root with `dev_ui` build tag (covers the unembedded-UI dev path)
+    cmds:
+      - go vet -tags={{.GO_BUILD_TAGS}},dev_ui ./...
+
+  go:vuln:
+    desc: govulncheck — hub root
+    preconditions:
+      - sh: command -v govulncheck >/dev/null
+        msg: "govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"
+    cmds:
+      - govulncheck -tags={{.GO_BUILD_TAGS}} ./...
+
+  go:vuln:caddy:
+    desc: govulncheck — caddy submodule
+    dir: caddy
+    preconditions:
+      - sh: command -v govulncheck >/dev/null
+        msg: "govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"
+    cmds:
+      - govulncheck -tags={{.GO_BUILD_TAGS}} ./...
+
+  go:vuln:all:
+    desc: Vulnerability scan both hub modules (root + caddy)
+    cmds:
+      - task: go:vuln
+      - task: go:vuln:caddy
+
+  go:test:
+    desc: Run Go tests with race + coverage (hub root + caddy submodule)
+    cmds:
+      - go test ./... -race -covermode=atomic -coverprofile=coverage.out -tags={{.GO_BUILD_TAGS}}
+      - go tool cover -func=coverage.out
+      - cd caddy && go test ./... -race -tags={{.GO_BUILD_TAGS}}
+
+  go:build:check:
+    desc: Compile-check all packages — hub root + caddy submodule (non-mutating, no artifacts)
+    cmds:
+      - go build -tags={{.GO_BUILD_TAGS}} ./...
+      - cd caddy && go build -tags={{.GO_BUILD_TAGS}} ./...
+
+  go:build:check:dev:
+    # Catches build errors in `public_fs_dev.go` and its dependents
+    # in packages with no `_test.go` under the `dev_ui` tag (which
+    # `go:test:dev` would otherwise miss).
+    desc: Compile-check all packages — hub root with `dev_ui` build tag
+    cmds:
+      - go build -tags={{.GO_BUILD_TAGS}},dev_ui ./...
+
+  # Race-stress repeat: same -race coverage as go:test, but -count=5 to
+  # surface schedule-dependent races a single pass would miss. Tier 2 only.
+  go:test:race:repeat:
+    desc: Race stress (-race -count=5) — hub root + caddy submodule — tier 2
+    cmds:
+      - go test ./... -race -count=5 -tags={{.GO_BUILD_TAGS}}
+      - cd caddy && go test ./... -race -count=5 -tags={{.GO_BUILD_TAGS}}
+
+  # ============================================
+  # CI pipelines — three tiers (`ci`, `verify`, `verify:full`).
+  # ============================================
+  # Tier 1 (`task ci`): fast, deterministic, offline. PR gate.
+  # Tier 2 (`task verify`): ci + govulncheck (networked) +
+  #     race-stress (`-race -count=5`). Pre-push / merge-queue.
+  # Tier 3 (`task verify:full`): verify + real-Redis matrix +
+  #     Docker build + Playwright conformance. Release / nightly.
+  ci:
+    desc: Tier 1 — fast PR gate across all modules (fmt + vet + lint + test + build + ui + md + sh)
+    cmds:
+      - task: go:fmt:check
+      - task: rt:fmt:check
+      - task: go:vet
+      - task: go:vet:dev
+      - task: rt:vet:all
+      - task: go:lint
+      - task: go:lint:dev
+      - task: rt:lint:all
+      - task: go:test
+      - task: go:test:dev
+      - task: rt:test:all
+      - task: go:build:check
+      - task: go:build:check:dev
+      - task: rt:build:all
+      - task: ui:check
+      - task: md:lint
+      - task: sh:lint
+      - task: dashboard:lint
+      - 'printf "\nTier 1 CI passed. Next: task verify (tier 2) / task verify:full (tier 3)\n"'
+
+  verify:
+    desc: Tier 2 — `ci` + govulncheck + race-stress (-race -count=5) across all modules
+    cmds:
+      - task: ci
+      - task: go:vuln:all
+      - task: rt:vuln:all
+      - task: go:test:race:repeat
+      - task: rt:test:race:repeat:all
+      - 'printf "\nTier 2 verify passed. Next: task verify:full for real-Redis + Docker + Playwright\n"'
+
+  verify:full:
+    desc: Tier 3 — `verify` + real-Redis matrix (Redis/Valkey/Cluster) + Docker build + Playwright conformance
+    cmds:
+      - task: verify
+      - task: rt:test:real:matrix
+      - task: docker:build
+      - task: rt:conformance
+      - 'printf "\nTier 3 verify:full passed\n"'
+
+  go:test:short:
+    desc: Run Go tests (short mode, no coverage)
+    cmds:
+      - go test ./... -short -tags={{.GO_BUILD_TAGS}}
+
+  # ============================================
+  # Stream Transport (Redis / Valkey) — cross-module run target
+  # Unit tests, lint, compose stacks live in redistransport/Taskfile.yml and
+  # are reachable as rt:* (e.g. `task rt:test`, `task rt:redis:up`).
+  # ============================================
+  go:run:redis:
+    desc: Run Mercure hub with redistransport (requires Redis/Valkey at localhost:6379)
+    dir: caddy/{{.SVC_NAME}}
+    cmds:
+      - go run -tags={{.GO_BUILD_TAGS}} -race . run -c ../../redistransport/redis-test.Caddyfile
+
+  # ============================================
+  # Dev workflows — one-shot scenario targets
+  # ============================================
+  # `dev:redis` is the operator-loop target for "native hub + redis backend
+  # + full debug UI". It composes the three otherwise-separate steps that a
+  # new contributor would have to discover from .env.dev's commented-out
+  # alternatives:
+  #   1. `rt:redis:up` (start backend + auto-wired RedisInsight)
+  #   2. swap `transport bolt {...}` -> `transport redis {...}` in
+  #      MERCURE_EXTRA_DIRECTIVES (env: override below; .env.dev itself is
+  #      not edited — keeps the bolt default for `task go:run` intact)
+  #   3. `go:run` against local.Caddyfile (debug UI, demo, anonymous, etc.)
+  # Tear down with Ctrl-C (hub) + `task rt:redis:down` (backend volumes).
+  dev:redis:
+    desc: Native hub + redis backend, debug UI on https://localhost; wgo rebuilds on .go, Caddy reloads .Caddyfile via --watch, public/ served live.
+    dir: caddy/{{.SVC_NAME}}
+    # go-task dotenv applies FIRST-WINS semantics — earlier files take
+    # precedence and later files only fill in unset vars. To make
+    # `.env.dev.redis` override `MERCURE_EXTRA_DIRECTIVES` from `.env.dev`
+    # (which defaults to bolt), it must come BEFORE `.env.dev` in the
+    # list. `.env.local` stays first so personal overrides still win
+    # over both committed files. All other vars (JWT keys, SERVER_NAME,
+    # MERCURE_HUB_NAME) inherit from `.env.dev`.
+    dotenv: ['../../.env.local', '../../.env.dev.redis', '../../.env.dev']
+    # `preconditions` must guard `.env.dev.redis` presence BEFORE
+    # `rt:redis:up` runs; otherwise go-task spins up the redis stack
+    # (network, containers, EULA bootstrap) and only then trips the
+    # file check, leaving an orphaned stack on disk. go-task v3 runs
+    # `deps:` BEFORE `preconditions:`, so `rt:redis:up` is intentionally
+    # placed in `cmds:` (after the precondition gate) instead of `deps:`.
+    preconditions:
+      - sh: test -f ../../.env.dev.redis
+        msg: '.env.dev.redis missing — restore via `git checkout .env.dev.redis` (it is committed via the `!.env.dev.redis` whitelist exception in .gitignore)'
+    vars:
+      # Opt-in tracing toggle. Passed as a var (not env) because go-task
+      # propagates `vars:` across `task:` calls but NOT task-level `env:`,
+      # so `dev:full:tracing` can flip this via `vars: {TRACING: "true"}`.
+      TRACING: '{{.TRACING | default "false"}}'
+      # Opt-in hub-process logging-to-file. When set (e.g.
+      # `task dev:redis LOG_FILE=/tmp/mercure.log`), wgo's stdout+stderr
+      # are tee'd to the file in addition to the terminal. The pipeline
+      # runs uniformly either way — when unset the sink is /dev/null —
+      # so the wgo invocation stays single-source. Use this when an
+      # audit or out-of-band reader needs the hub output after the
+      # session ends.
+      #
+      # Cost note: `tee` is paid on every log line even when LOG_FILE is
+      # unset (the pipeline is unconditional; `/dev/null` is the no-op
+      # sink). The earlier conditional shape avoided this by skipping the
+      # pipe entirely in the off path; we traded that micro-optimization
+      # for single-source clarity. tee adds a fork + pipe per line which
+      # is negligible at hub log rates.
+      #
+      # Concurrency note: a second `task dev:redis` errors at the `:443`
+      # bind after wgo's `go build` step completes; `tee -a "$LOG_FILE"`
+      # has no file-locking, so the race only matters in the narrow build
+      # window before the bind error fires (the second invocation's
+      # session-start marker AND any pre-bind log line would interleave
+      # into LOG_FILE). Documented rather than locked because the
+      # user-supplied LOG_FILE path is the contract.
+      LOG_FILE: '{{.LOG_FILE | default ""}}'
+    env:
+      # The `dev_ui` build tag swaps //go:embed for os.DirFS. Set the
+      # public/ path relative to the task's cwd (the `dir:` above runs
+      # this task from caddy/mercure, so the repo's public/ is ../../public).
+      MERCURE_PUBLIC_DIR: '../../public'
+    cmds:
+      - task: rt:redis:up
+      - mkdir -p data
+      - |
+        printf "\n=== Hub starting against redis://localhost:6379 ===\n"
+        printf "  Debug UI:     %s  (live UI: edits to public/ are live)\n" "{{.MERCURE_UI}}"
+        printf "  RedisInsight: %s\n" "{{.REDISINSIGHT_URL}}"
+        printf "  Metrics:      %s\n" "{{.METRICS_URL}}"
+        {{if eq .TRACING "true"}}printf "  Jaeger:       http://localhost:16686  (traces; service \"mercure-hub\")\n"{{end}}
+        {{if .LOG_FILE}}printf "  Log file:     %s  (hub stdout+stderr tee'd; terminal stream preserved)\n" "{{.LOG_FILE}}"{{end}}
+        printf "  Watch:        wgo rebuilds the hub on .go changes across hub + caddy + redistransport modules. Caddyfile edits hot-reload via Caddy's own --watch (no full restart).\n"
+        if [ ! -f "$HOME/.caddy-trust-local-sha1" ]; then
+            printf "  TLS:          WARN Caddy root cert not yet trusted — browser will warn on first load.\n"
+            printf "                After the cert is generated (it will be on first run), run 'task tls:trust' to silence the warning.\n"
+        fi
+        # Ctrl-C only stops the hub + go-task tree; the Docker sidecars
+        # (redis, and the metrics/Jaeger stacks if a dev:full* variant
+        # started them) keep running. List the matching down tasks so they
+        # aren't orphaned. dev:redis itself only starts redis.
+        printf "  Stop:         Ctrl-C, then 'task rt:redis:down'{{if eq .TRACING "true"}} + 'task rt:metrics:down:redis' + 'task rt:tracing:down:redis'{{end}}\n\n"
+      # wgo watches across all 4 modules (hub/, caddy/, redistransport/,
+      # redistransport/caddy/) via -root=../.. .
+      #
+      # `-file=\.go$` only — `local.Caddyfile` is intentionally NOT in the
+      # watch set so wgo doesn't fight Caddy's own `run -w` watcher. Caddy's
+      # admin-API hot-reload handles Caddyfile edits gracefully (preserves
+      # SSE state); wgo handles the Go-source rebuild path.
+      #
+      # `-xdir` patterns use `(^|/)NAME($|/)` to match the directory NAME
+      # at any depth. Anchored `^NAME$` would only match top-level dirs;
+      # wgo matches the full path-relative-to-root, so `caddy/mercure/data`
+      # would slip past `^data$`.
+      #
+      # `::` chains commands: build, then run the binary. Going through a
+      # built binary (instead of `go run`) shortens the signal chain
+      # (wgo → mercure-dev directly, no `go run` wrapper) so SIGINT on
+      # rebuild doesn't orphan Caddy holding `:443`.
+      - |
+        {{if eq .TRACING "true"}}
+        # Tracing is opt-in (TRACING=true, set by `dev:full:tracing`). Export
+        # here in the hub's own shell — NOT in the task `env:` block — so the
+        # default loop never exports empty OTEL_* strings that would clobber a
+        # developer's inherited config or trip the SDK (an empty, present
+        # OTEL_TRACES_SAMPLER errors). MERCURE_TRACING_DIRECTIVE activates
+        # local.Caddyfile's gated `tracing` directive. PROTOCOL must be set:
+        # autoexport defaults to `http/protobuf` (port 4318), but we point at
+        # Jaeger's gRPC port 4317, so the two must agree — gRPC + 4317
+        # (http:// = insecure, no TLS). EXPORTER (otlp) and SAMPLER
+        # (ParentBased(AlwaysSample)) default correctly, so we leave them
+        # unset. Requires the Jaeger sidecar `dev:full:tracing` starts.
+        export MERCURE_TRACING_DIRECTIVE=tracing
+        export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+        export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+        export OTEL_SERVICE_NAME=mercure-hub
+        {{end}}
+        # `set -o pipefail` so the wgo|tee pipeline propagates wgo's exit
+        # status; without it, `tee`'s exit shadows a hub crash. mvdan.cc/sh
+        # (go-task v3's shell interpreter) honors pipefail. Bash process
+        # substitution `>(tee ...)` was tried first and produced empty
+        # output here — the straight-pipe shape is what worked, and it's
+        # also more portable across non-bash interpreters.
+        #
+        # SIGINT (Ctrl-C) caveat: shell, wgo, tee, and mercure-dev share the
+        # foreground process group, so they all receive SIGINT together. If
+        # `tee` exits before mercure-dev's graceful shutdown finishes, any
+        # late stdout write from mercure-dev triggers SIGPIPE — by then
+        # Caddy has already closed the :443 listener, so the kernel still
+        # releases the port on exit. The "Stop:" banner above lists the
+        # explicit teardown tasks; that's the canonical cleanup path.
+        set -o pipefail
+        # When LOG_FILE is set, fail fast if the path is unwritable rather
+        # than letting `tee` silently drop output to a broken sink.
+        {{if .LOG_FILE}}
+        mkdir -p "$(dirname "{{.LOG_FILE}}")"
+        : >> "{{.LOG_FILE}}" || { printf "ERROR: cannot append to LOG_FILE=%s\n" "{{.LOG_FILE}}" >&2; exit 1; }
+        printf "[%s] dev:redis session start (LOG_FILE=%s)\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "{{.LOG_FILE}}" >> "{{.LOG_FILE}}"
+        {{end}}
+        LOG_TARGET={{if .LOG_FILE}}"{{.LOG_FILE}}"{{else}}/dev/null{{end}}
+        go run github.com/bokwoon95/wgo@v0.6.4 \
+            -file='\.go$' -xfile='_test\.go$' \
+            -xdir='(^|/)\.git($|/)' -xdir='(^|/)\.idea($|/)' \
+            -xdir='(^|/)node_modules($|/)' -xdir='(^|/)data($|/)' -xdir='(^|/)bin($|/)' \
+            -xdir='(^|/)coverage($|/)' -xdir='(^|/)dist($|/)' \
+            -root=../.. \
+            go build -ldflags="{{.GO_LDFLAGS}}" -tags={{.GO_BUILD_TAGS}},dev_ui -race -o /tmp/mercure-dev . \
+            :: /tmp/mercure-dev run -w -c ../../local.Caddyfile \
+            2>&1 | tee -a "$LOG_TARGET"
+
+  dev:full:
+    desc: redis + RedisInsight + Prometheus + Grafana + redis_exporter + native hub (wgo watch)
+    # rt:redis:up first (so the redis network exists when metrics scrapers attach),
+    # then rt:metrics:up:redis (Prometheus + Grafana + redis_exporter on the metrics
+    # profile), then dev:redis (idempotent rt:redis:up + native hub with wgo).
+    # Hoists the .env.dev.redis precondition so a missing file fails fast BEFORE
+    # spinning up Docker stacks (dev:redis's own precondition would only fire
+    # after the cmds: above already started the redis stack).
+    preconditions:
+      - sh: test -f .env.dev.redis
+        msg: '.env.dev.redis missing — restore via `git checkout .env.dev.redis` (it is committed via the `!.env.dev.redis` whitelist exception in .gitignore)'
+    cmds:
+      - task: rt:redis:up
+      - task: rt:metrics:up:redis
+      - task: dev:redis
+
+  dev:redis:fresh:
+    desc: Clean-slate dev:redis — wipe redis volumes + bolt DB, then start
+    # rt:redis:down removes containers + volumes (wipes stream, presence,
+    # consumer groups). clean:db removes the host-side bolt.db. Then
+    # dev:redis brings up a fresh redis stack and the hub.
+    # Hoist the .env.dev.redis precondition so a missing file fails BEFORE the
+    # destructive rt:redis:down + clean:db steps — otherwise the convenience
+    # command would wipe local state then crash on the downstream precondition.
+    preconditions:
+      - sh: test -f .env.dev.redis
+        msg: '.env.dev.redis missing — restore via `git checkout .env.dev.redis` before invoking this destructive task'
+    cmds:
+      - task: rt:redis:down
+      - task: clean:db
+      - task: dev:redis
+
+  dev:full:tracing:
+    desc: dev:full + Jaeger — full observability loop (metrics + traces + RedisInsight). Traces at http://localhost:16686
+    # Same stack as dev:full plus the profile-gated Jaeger sidecar, then
+    # dev:redis with TRACING=true (see that task's `vars:` for why it's a var).
+    # Jaeger is opt-in (not in dev:full) because its image is ~80 MB and most
+    # dev loops don't trace; `task rt:tracing:down:redis` stops it (this Jaeger
+    # runs under the mercure-redis project, not the root `tracing:down` pair).
+    preconditions:
+      - sh: test -f .env.dev.redis
+        msg: '.env.dev.redis missing — restore via `git checkout .env.dev.redis` (committed via the `!.env.dev.redis` whitelist exception in .gitignore)'
+    cmds:
+      - task: rt:redis:up
+      - task: rt:metrics:up:redis
+      - task: rt:tracing:up:redis
+      - task: dev:redis
+        vars: { TRACING: "true" }
+
+  # ============================================
+  # Docker Compose (container lifecycle)
+  # ============================================
+  _check:docker:
+    internal: true
+    preconditions:
+      - sh: docker info >/dev/null 2>&1
+        msg: "Docker daemon is not running (start Docker Desktop or run `orb start`)"
+    cmds:
+      - "true"
+
+  caddy:validate:
+    desc: Validate CADDYFILE syntax with the Mercure binary (uses .env.dev by default)
+    deps: [go:build]
+    cmds:
+      - "{{.BIN_DIR}}/{{.GO_OS}}-{{.GO_ARCH}}/mercure validate --config {{.CADDYFILE}} --adapter caddyfile"
+
+  up:
+    desc: Start Mercure hub container
+    deps: [_check:docker]
+    cmds:
+      - docker compose up
+
+  tracing:up:
+    desc: Bring up the hub stack plus Jaeger (web UI at http://localhost:16686)
+    deps: [_check:docker]
+    cmds:
+      - docker compose --profile tracing up -d
+      - 'printf "\nJaeger UI: http://localhost:16686 (service: mercure-hub)\nTraces appear once the Caddyfile enables the tracing directive — see docs/hub/tracing.md\n"'
+
+  tracing:down:
+    desc: Stop Jaeger on the root hub stack (pairs with tracing:up)
+    # Pairs with tracing:up — both target the root `compose` project (the bolt
+    # hub stack). The Redis dev loop (dev:full:tracing) starts its Jaeger under
+    # the mercure-redis project instead; tear that one down with
+    # `task rt:tracing:down:redis`.
+    cmds:
+      - docker compose --profile tracing stop jaeger
+      - docker compose --profile tracing rm -f jaeger
+
+  up:detach:
+    desc: Start Mercure hub container (detached)
+    aliases: [upd]
+    deps: [_check:docker]
+    cmds:
+      - docker compose up -d
+
+  up:build:
+    desc: Build and start Mercure hub container (detached, trusts TLS cert)
+    deps: [_check:docker, version:check:upstream]
+    cmds:
+      # Dockerfile is multi-stage — builds the Mercure binary from source
+      # inside the build stage, so no host pre-build or binary staging is needed.
+      - docker compose up --build -d --wait
+      # Best-effort: ignore_error so a headless / locked-keychain box (where
+      # `security add-trusted-cert` can't get GUI auth) doesn't fail the build.
+      # Run `task tls:trust:docker` manually when needed.
+      - task: tls:trust:docker
+        ignore_error: true
+
+  down:
+    desc: Stop and remove containers (keeps volumes)
+    deps: [_check:docker]
+    cmds:
+      - docker compose down --remove-orphans
+
+  down:clean:
+    desc: Stop and remove containers and volumes
+    deps: [_check:docker]
+    cmds:
+      - docker compose down -v --remove-orphans
+
+  restart:
+    desc: Restart Mercure hub container
+    deps: [_check:docker]
+    cmds:
+      - docker compose restart {{.CONTAINER_NAME}}
+
+  ps:
+    desc: Show container status
+    deps: [_check:docker]
+    cmds:
+      - docker compose ps
+
+  logs:
+    desc: Follow container logs
+    deps: [_check:docker]
+    aliases: [l]
+    cmds:
+      - docker compose logs -f {{.CONTAINER_NAME}}
+
+  logs:tail:
+    desc: Show last 100 log lines
+    deps: [_check:docker]
+    cmds:
+      - docker compose logs --tail=100 {{.CONTAINER_NAME}}
+
+  # ============================================
+  # Docker Build & Registry
+  # ============================================
+  docker:build:_:
+    internal: true
+    deps: [_check:docker, version:check:upstream]
+    requires:
+      vars: [TARGET_PLATFORM, TARGET_IMAGE]
+    env:
+      PLATFORM: "{{.TARGET_PLATFORM}}"
+      SVC_IMAGE: "{{.TARGET_IMAGE}}"
+    cmds:
+      - docker compose build {{.SVC_NAME}}
+      - 'echo "Built: {{.TARGET_IMAGE}}"'
+
+  docker:build:
+    desc: Build Docker image (current arch)
+    cmds:
+      - task: docker:build:_
+        vars: { TARGET_PLATFORM: "{{.DOCKER_OS}}/{{.GO_ARCH}}", TARGET_IMAGE: "{{.SVC_IMAGE}}" }
+
+  docker:build:amd64:
+    desc: Build Docker image for Linux x86_64 (amd64)
+    cmds:
+      - task: docker:build:_
+        vars: { TARGET_PLATFORM: linux/amd64, TARGET_IMAGE: "{{.IMAGE_REPO}}:{{.SVC_VERSION}}-linux-amd64" }
+
+  docker:build:arm64:
+    desc: Build Docker image for Linux ARM64
+    cmds:
+      - task: docker:build:_
+        vars: { TARGET_PLATFORM: linux/arm64, TARGET_IMAGE: "{{.IMAGE_REPO}}:{{.SVC_VERSION}}-linux-arm64" }
+
+  docker:tag:
+    desc: Show current image tag
+    cmds:
+      - echo "{{.SVC_IMAGE}}"
+
+  # ============================================
+  # Monitoring (health, status, metrics)
+  # ============================================
+  health:
+    desc: Check if Mercure hub is healthy (transport-aware via admin API)
+    cmds:
+      - |
+        if curl -sf http://localhost:2019/mercure/health/ready > /dev/null 2>&1; then
+          echo "Mercure hub is healthy"
+        else
+          echo "Mercure hub is not responding"
+          exit 1
+        fi
+
+  status:
+    desc: Show service status and configuration
+    cmds:
+      - 'echo "Mercure Hub Status"'
+      - 'echo "=================="'
+      - 'echo "Image: {{.SVC_IMAGE}}"'
+      - 'echo "Container: {{.CONTAINER_NAME}}"'
+      - 'echo ""'
+      - docker compose ps 2>/dev/null || echo "Container not running"
+
+  metrics:
+    desc: Fetch Prometheus metrics from Mercure hub
+    cmds:
+      - curl -sf {{.METRICS_URL}} || { echo "Metrics endpoint not responding"; exit 1; }
+
+  metrics:mercure:
+    desc: Show Mercure-specific metrics only
+    cmds:
+      - |
+        curl -sf {{.METRICS_URL}} | grep "^mercure_" || {
+          echo "No Mercure metrics found (hub may not have received traffic yet)"
+        }
+
+  metrics:watch:
+    desc: Watch live subscriber count (refreshes every 2s)
+    cmds:
+      - |
+        echo "Watching mercure_subscribers_connected (Ctrl+C to stop)"
+        while true; do
+          count=$(curl -sf {{.METRICS_URL}} | grep "^mercure_subscribers_connected " | awk '{print $2}')
+          echo "$(date +%H:%M:%S) subscribers_connected: ${count:-0}"
+          sleep 2
+        done
+
+  # ============================================
+  # Container Inspection
+  # ============================================
+  exec:
+    desc: Open shell in Mercure container
+    deps: [_check:docker]
+    cmds:
+      - docker compose exec {{.CONTAINER_NAME}} sh
+
+  inspect:
+    desc: Inspect container configuration
+    deps: [_check:docker]
+    cmds:
+      - docker inspect {{.CONTAINER_NAME}} | jq .
+
+  inspect:health:
+    desc: Show container health status
+    deps: [_check:docker]
+    cmds:
+      - docker inspect --format='{{`{{json .State.Health}}`}}' {{.CONTAINER_NAME}} | jq .
+
+  inspect:env:
+    desc: Show container environment variables
+    deps: [_check:docker]
+    cmds:
+      - docker compose exec {{.CONTAINER_NAME}} env | sort
+
+  # ============================================
+  # Cleanup
+  # ============================================
+  clean:
+    desc: Clean build artifacts (keeps database)
+    cmds:
+      - rm -rf bin/
+      - find . -name "*.out" -type f -delete
+      - 'echo "Cleaned build artifacts"'
+
+  clean:binary:
+    desc: Remove compiled binaries for current version
+    cmds:
+      - rm -rf {{.BIN_DIR}}
+      - 'echo "Cleaned: {{.BIN_DIR}}"'
+
+  clean:binary:all:
+    desc: Remove all compiled binaries
+    cmds:
+      - rm -rf bin/
+      - 'echo "Cleaned: bin/"'
+
+  clean:db:
+    desc: Remove Bolt database (host-side, for go:run)
+    cmds:
+      - rm -rf {{.CADDY_DIR}}/data/
+      - 'echo "Cleaned host database files (use clean:volumes for Docker)"'
+
+  clean:docker:
+    desc: Stop container and prune dangling images
+    deps: [down]
+    cmds:
+      - docker image prune --filter dangling=true -f
+
+  clean:image:
+    desc: Remove the Mercure Docker image
+    # Guard on the daemon (a daemon-down `inspect` must not read as "absent"), and
+    # inspect-then-rmi so a real "image in use" error surfaces instead of being
+    # swallowed by `2>/dev/null || true`.
+    deps: [_check:docker]
+    cmds:
+      - 'if docker image inspect {{.SVC_IMAGE}} >/dev/null 2>&1; then docker rmi {{.SVC_IMAGE}} && echo "Removed: {{.SVC_IMAGE}}"; else echo "{{.SVC_IMAGE}} not present"; fi'
+
+  clean:volumes:
+    desc: Remove all Docker volumes (TLS certs, config, data, metrics)
+    # Daemon-guarded; inspect-then-rm and accumulate rc so an in-use volume fails
+    # the task. NOTE: `rm && echo` inside a loop would NOT propagate — `&&` exempts
+    # rm from set -e and a loop's exit is only its last iteration — hence rc.
+    deps: [_check:docker]
+    cmds:
+      - |
+        rc=0
+        for v in compose_mercure_data compose_mercure_config compose_prometheus_data compose_grafana_data; do
+          if docker volume inspect "$v" >/dev/null 2>&1; then
+            if docker volume rm "$v"; then echo "removed $v"; else echo "FAILED to remove $v (in use?)" >&2; rc=1; fi
+          else
+            echo "$v not present"
+          fi
+        done
+        exit $rc
+
+  clean:volumes:mercure:
+    desc: Remove Mercure data and config volumes
+    deps: [_check:docker]
+    cmds:
+      - |
+        rc=0
+        for v in compose_mercure_data compose_mercure_config; do
+          if docker volume inspect "$v" >/dev/null 2>&1; then
+            if docker volume rm "$v"; then echo "removed $v"; else echo "FAILED to remove $v (in use?)" >&2; rc=1; fi
+          else echo "$v not present"; fi
+        done
+        exit $rc
+
+  clean:volumes:prometheus:
+    desc: Remove Prometheus data volume
+    deps: [_check:docker]
+    cmds:
+      - 'if docker volume inspect compose_prometheus_data >/dev/null 2>&1; then docker volume rm compose_prometheus_data && echo "removed compose_prometheus_data"; else echo "compose_prometheus_data not present"; fi'
+
+  clean:volumes:grafana:
+    desc: Remove Grafana data volume
+    deps: [_check:docker]
+    cmds:
+      - 'if docker volume inspect compose_grafana_data >/dev/null 2>&1; then docker volume rm compose_grafana_data && echo "removed compose_grafana_data"; else echo "compose_grafana_data not present"; fi'
+
+  clean:all:
+    desc: Full cleanup (binary, database, containers, images, volumes)
+    deps: [_check:docker]
+    cmds:
+      - task: down
+      - task: clean
+      - task: clean:db
+      - task: clean:volumes
+      - docker image prune --filter dangling=true -f
+      - 'if docker image inspect {{.SVC_IMAGE}} >/dev/null 2>&1; then docker rmi {{.SVC_IMAGE}} && echo "Removed: {{.SVC_IMAGE}}"; else echo "{{.SVC_IMAGE}} not present"; fi'
+      - 'echo "Cleaned all Mercure resources"'
+
+
+  # ============================================
+  # Version Management
+  # ============================================
+  # SVC_VERSION is the fork's image tag — bumped by version:bump:patch /
+  # minor / major and version:set. These four tasks DO NOT touch
+  # charts/mercure/Chart.yaml: that file's `version:` and `appVersion:`
+  # track upstream and are bumped by version:bump:upstream (wired into
+  # `task upstream:sync`). The fork does not publish its own Helm chart;
+  # deployments use the upstream chart with a custom image tag.
+  # ============================================
+  version:
+    desc: Show current version
+    cmds:
+      - 'echo "{{.SVC_VERSION}}"'
+
+  version:full:
+    desc: Show full version details
+    cmds:
+      - 'echo "Version:  {{.SVC_VERSION}}"'
+      - 'echo "Upstream: {{.UPSTREAM_VERSION}}"'
+      - 'echo "Transport: {{.RT_VERSION}}"'
+      - 'echo "Image:    {{.SVC_IMAGE}}"'
+
+  version:bump:patch:
+    desc: "Bump patch version (e.g., v0.0.1 -> v0.0.2)"
+    vars:
+      CURRENT: "{{.SVC_VERSION}}"
+      # awk coerces pre-release suffixes (e.g., "0-rc" -> 0) so v1.0.0-rc.1 bumps to v1.0.1
+      NEXT:
+        sh: "echo \"{{.SVC_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.%d.%d\", $1, $2, $3+1}'"
+    cmds:
+      - "perl -i -pe 's/\\QSVC_VERSION: {{.CURRENT}}\\E/SVC_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\Q@version {{.CURRENT}}\\E/@version {{.NEXT}}/' public/app.js"
+      - "perl -i -pe \"s/\\QSVC_VERSION = '{{.CURRENT}}'\\E/SVC_VERSION = '{{.NEXT}}'/\" public/app.js"
+      - 'echo "Bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:bump:minor:
+    desc: "Bump minor version (e.g., v0.0.1 -> v0.1.0)"
+    vars:
+      CURRENT: "{{.SVC_VERSION}}"
+      NEXT:
+        sh: "echo \"{{.SVC_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.%d.0\", $1, $2+1}'"
+    cmds:
+      - "perl -i -pe 's/\\QSVC_VERSION: {{.CURRENT}}\\E/SVC_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\Q@version {{.CURRENT}}\\E/@version {{.NEXT}}/' public/app.js"
+      - "perl -i -pe \"s/\\QSVC_VERSION = '{{.CURRENT}}'\\E/SVC_VERSION = '{{.NEXT}}'/\" public/app.js"
+      - 'echo "Bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:bump:major:
+    desc: "Bump major version (e.g., v0.0.1 -> v1.0.0)"
+    vars:
+      CURRENT: "{{.SVC_VERSION}}"
+      NEXT:
+        sh: "echo \"{{.SVC_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.0.0\", $1+1}'"
+    cmds:
+      - "perl -i -pe 's/\\QSVC_VERSION: {{.CURRENT}}\\E/SVC_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\Q@version {{.CURRENT}}\\E/@version {{.NEXT}}/' public/app.js"
+      - "perl -i -pe \"s/\\QSVC_VERSION = '{{.CURRENT}}'\\E/SVC_VERSION = '{{.NEXT}}'/\" public/app.js"
+      - 'echo "Bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:set:
+    desc: "Set version explicitly (usage: task version:set V=v1.2.3)"
+    requires:
+      vars: [V]
+    # V is exported via env so the precondition shell reads it as a literal
+    # value (no shell expansion) — guards against malicious V like
+    # `'; rm -rf ~; echo '` that would otherwise interpolate into the perl
+    # cmds below (which substitute `{{.V}}` at template time, BEFORE shell
+    # sees the result — a single-quote in V would close perl's `s///`
+    # delimiter and let the remainder hit shell).
+    env:
+      V: '{{.V}}'
+    preconditions:
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be semver with leading "v" (e.g. v1.2.3 or v1.2.3-rc.1), got: {{.V}}'
+    cmds:
+      - "perl -i -pe 's/\\QSVC_VERSION: {{.SVC_VERSION}}\\E/SVC_VERSION: {{.V}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\Q@version {{.SVC_VERSION}}\\E/@version {{.V}}/' public/app.js"
+      - "perl -i -pe \"s/\\QSVC_VERSION = '{{.SVC_VERSION}}'\\E/SVC_VERSION = '{{.V}}'/\" public/app.js"
+      - 'echo "Set: {{.SVC_VERSION}} -> {{.V}}"'
+
+  # ============================================
+  # Redistransport version bumps
+  # ============================================
+  # RT_VERSION lives in two places (Taskfile.yml var + Dockerfile ARG) and
+  # is injected into the binary via the
+  # github.com/lzrf0cuz/mercure/redistransport.version ldflag. Mirrors the
+  # SVC_VERSION pattern but stays in its own task name space because the
+  # transport is a separate Go module with its own release cadence.
+  # ============================================
+  version:bump:rt:patch:
+    desc: "Bump redistransport patch version (e.g., v0.0.1 -> v0.0.2)"
+    vars:
+      CURRENT: "{{.RT_VERSION}}"
+      NEXT:
+        sh: "echo \"{{.RT_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.%d.%d\", $1, $2, $3+1}'"
+    cmds:
+      # Match `RT_VERSION:` + v-prefixed value flexibly. CAN'T interpolate
+      # `{{.RT_VERSION}}` (or {{.CURRENT}} which derives from it) into the
+      # search pattern: the included `redistransport/Taskfile.yml` defines
+      # `RT_VERSION: 0.0.1` (no v — for the Go ldflag) which shadows root's
+      # `v0.0.1` at template time, breaking the literal-match substitution.
+      - "perl -i -pe 's/RT_VERSION:\\s+v\\S+/RT_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\QARG RT_VERSION=\\E.*/ARG RT_VERSION={{.NEXT}}/' Dockerfile"
+      - 'grep -q "^  RT_VERSION: {{.NEXT}}$" Taskfile.yml || { echo "rt bump: Taskfile.yml RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      - 'grep -q "^ARG RT_VERSION={{.NEXT}}$" Dockerfile || { echo "rt bump: Dockerfile ARG RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      # The included redistransport/Taskfile.yml carries the no-v ldflag value
+      # (RT_VERSION: x.y.z) the release preconditions read; bump it too or every
+      # release blocks on the V != RT_VERSION gate.
+      - "perl -i -pe 's/^  RT_VERSION:\\s+\\S+/  RT_VERSION: {{trimPrefix \"v\" .NEXT}}/' redistransport/Taskfile.yml"
+      - 'grep -q "^  RT_VERSION: {{trimPrefix "v" .NEXT}}$" redistransport/Taskfile.yml || { echo "rt bump: redistransport/Taskfile.yml RT_VERSION not updated to {{trimPrefix "v" .NEXT}}"; exit 1; }'
+      - 'echo "Redistransport bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:bump:rt:minor:
+    desc: "Bump redistransport minor version (e.g., v0.0.1 -> v0.1.0)"
+    vars:
+      CURRENT: "{{.RT_VERSION}}"
+      NEXT:
+        sh: "echo \"{{.RT_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.%d.0\", $1, $2+1}'"
+    cmds:
+      # Match `RT_VERSION:` + v-prefixed value flexibly. CAN'T interpolate
+      # `{{.RT_VERSION}}` (or {{.CURRENT}} which derives from it) into the
+      # search pattern: the included `redistransport/Taskfile.yml` defines
+      # `RT_VERSION: 0.0.1` (no v — for the Go ldflag) which shadows root's
+      # `v0.0.1` at template time, breaking the literal-match substitution.
+      - "perl -i -pe 's/RT_VERSION:\\s+v\\S+/RT_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\QARG RT_VERSION=\\E.*/ARG RT_VERSION={{.NEXT}}/' Dockerfile"
+      - 'grep -q "^  RT_VERSION: {{.NEXT}}$" Taskfile.yml || { echo "rt bump: Taskfile.yml RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      - 'grep -q "^ARG RT_VERSION={{.NEXT}}$" Dockerfile || { echo "rt bump: Dockerfile ARG RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      # The included redistransport/Taskfile.yml carries the no-v ldflag value
+      # (RT_VERSION: x.y.z) the release preconditions read; bump it too or every
+      # release blocks on the V != RT_VERSION gate.
+      - "perl -i -pe 's/^  RT_VERSION:\\s+\\S+/  RT_VERSION: {{trimPrefix \"v\" .NEXT}}/' redistransport/Taskfile.yml"
+      - 'grep -q "^  RT_VERSION: {{trimPrefix "v" .NEXT}}$" redistransport/Taskfile.yml || { echo "rt bump: redistransport/Taskfile.yml RT_VERSION not updated to {{trimPrefix "v" .NEXT}}"; exit 1; }'
+      - 'echo "Redistransport bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:bump:rt:major:
+    desc: "Bump redistransport major version (e.g., v0.0.1 -> v1.0.0)"
+    vars:
+      CURRENT: "{{.RT_VERSION}}"
+      NEXT:
+        sh: "echo \"{{.RT_VERSION}}\" | sed 's/^v//' | awk -F. '{printf \"v%d.0.0\", $1+1}'"
+    cmds:
+      # Match `RT_VERSION:` + v-prefixed value flexibly. CAN'T interpolate
+      # `{{.RT_VERSION}}` (or {{.CURRENT}} which derives from it) into the
+      # search pattern: the included `redistransport/Taskfile.yml` defines
+      # `RT_VERSION: 0.0.1` (no v — for the Go ldflag) which shadows root's
+      # `v0.0.1` at template time, breaking the literal-match substitution.
+      - "perl -i -pe 's/RT_VERSION:\\s+v\\S+/RT_VERSION: {{.NEXT}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\QARG RT_VERSION=\\E.*/ARG RT_VERSION={{.NEXT}}/' Dockerfile"
+      - 'grep -q "^  RT_VERSION: {{.NEXT}}$" Taskfile.yml || { echo "rt bump: Taskfile.yml RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      - 'grep -q "^ARG RT_VERSION={{.NEXT}}$" Dockerfile || { echo "rt bump: Dockerfile ARG RT_VERSION not updated to {{.NEXT}}"; exit 1; }'
+      # The included redistransport/Taskfile.yml carries the no-v ldflag value
+      # (RT_VERSION: x.y.z) the release preconditions read; bump it too or every
+      # release blocks on the V != RT_VERSION gate.
+      - "perl -i -pe 's/^  RT_VERSION:\\s+\\S+/  RT_VERSION: {{trimPrefix \"v\" .NEXT}}/' redistransport/Taskfile.yml"
+      - 'grep -q "^  RT_VERSION: {{trimPrefix "v" .NEXT}}$" redistransport/Taskfile.yml || { echo "rt bump: redistransport/Taskfile.yml RT_VERSION not updated to {{trimPrefix "v" .NEXT}}"; exit 1; }'
+      - 'echo "Redistransport bumped: {{.CURRENT}} -> {{.NEXT}}"'
+
+  version:set:rt:
+    desc: "Set redistransport version explicitly (usage: task version:set:rt V=v1.2.3)"
+    requires:
+      vars: [V]
+    # V is exported via env so the precondition shell reads it as a literal
+    # value (no shell expansion) — guards against malicious V like
+    # `'; rm -rf ~; echo '` that would otherwise interpolate into the perl
+    # cmds below.
+    env:
+      V: '{{.V}}'
+    preconditions:
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be semver with leading "v" (e.g. v1.2.3 or v1.2.3-rc.1), got: {{.V}}'
+    cmds:
+      # Match `RT_VERSION:` + v-prefixed value flexibly. CAN'T interpolate
+      # `{{.RT_VERSION}}` into the pattern: the included `redistransport/
+      # Taskfile.yml` defines `RT_VERSION: 0.0.1` (no v — for the Go ldflag)
+      # which shadows root's `v0.0.1` at template time.
+      - "perl -i -pe 's/RT_VERSION:\\s+v\\S+/RT_VERSION: {{.V}}/' Taskfile.yml"
+      - "perl -i -pe 's/\\QARG RT_VERSION=\\E.*/ARG RT_VERSION={{.V}}/' Dockerfile"
+      - 'grep -q "^  RT_VERSION: {{.V}}$" Taskfile.yml || { echo "version:set:rt: Taskfile.yml RT_VERSION not updated to {{.V}}"; exit 1; }'
+      - 'grep -q "^ARG RT_VERSION={{.V}}$" Dockerfile || { echo "version:set:rt: Dockerfile ARG RT_VERSION not updated to {{.V}}"; exit 1; }'
+      # The included redistransport/Taskfile.yml carries the no-v ldflag value
+      # the release preconditions read; bump it too or every release blocks on
+      # the V != RT_VERSION gate.
+      - "perl -i -pe 's/^  RT_VERSION:\\s+\\S+/  RT_VERSION: {{trimPrefix \"v\" .V}}/' redistransport/Taskfile.yml"
+      - 'grep -q "^  RT_VERSION: {{trimPrefix "v" .V}}$" redistransport/Taskfile.yml || { echo "version:set:rt: redistransport/Taskfile.yml RT_VERSION not updated to {{trimPrefix "v" .V}}"; exit 1; }'
+      - 'echo "Redistransport set: {{.RT_VERSION}} -> {{.V}}"'
+
+  version:bump:upstream:
+    desc: "Set upstream version (usage: task version:bump:upstream V=v0.22.0)"
+    requires:
+      vars: [V]
+    cmds:
+      # Each substitute is followed by a grep guard that fails the task if
+      # the new value isn't present after the edit. Perl's `s///` exits 0
+      # on zero substitutions (e.g. when a file already drifted off the
+      # anchored old value), which would otherwise produce a "successful"
+      # bump that silently leaves one of the three files stale.
+      - "perl -i -pe 's/\\QUPSTREAM_VERSION: {{.UPSTREAM_VERSION}}\\E/UPSTREAM_VERSION: {{.V}}/' Taskfile.yml"
+      - 'grep -q "^  UPSTREAM_VERSION: {{.V}}$" Taskfile.yml || { echo "version:bump:upstream: Taskfile.yml not updated to {{.V}} (current value is not the anchored old)"; exit 1; }'
+      - "perl -i -pe 's/\\QARG UPSTREAM_VERSION=\\E.*/ARG UPSTREAM_VERSION={{.V}}/' Dockerfile"
+      - 'grep -q "^ARG UPSTREAM_VERSION={{.V}}$" Dockerfile || { echo "version:bump:upstream: Dockerfile not updated to {{.V}}"; exit 1; }'
+      - "perl -i -pe 's/\\QappVersion: \"{{.UPSTREAM_VERSION}}\"\\E/appVersion: \"{{.V}}\"/' charts/mercure/Chart.yaml"
+      - 'grep -q "^appVersion: \"{{.V}}\"$" charts/mercure/Chart.yaml || { echo "version:bump:upstream: charts/mercure/Chart.yaml not updated to {{.V}} (anchor mismatch — Chart.yaml may have drifted)"; exit 1; }'
+      - 'echo "Upstream: {{.UPSTREAM_VERSION}} -> {{.V}}"'
+
+  version:check:upstream:
+    desc: "Verify declared UPSTREAM_VERSION matches the upstream tag reachable from HEAD"
+    silent: true
+    vars:
+      MERGE_BASE:
+        sh: git merge-base HEAD upstream/main 2>/dev/null || true
+      EXPECTED:
+        sh: |
+          base=$(git merge-base HEAD upstream/main 2>/dev/null) || exit 0
+          git describe --tags --match 'v[0-9]*' --abbrev=0 "$base" 2>/dev/null || true
+      DECLARED_TASKFILE: "{{.UPSTREAM_VERSION}}"
+      DECLARED_DOCKERFILE:
+        sh: 'awk -F= ''/^ARG UPSTREAM_VERSION=/ {print $2}'' Dockerfile'
+      DECLARED_CHART:
+        sh: 'awk ''/^appVersion:/ {gsub(/"/, "", $2); print $2}'' charts/mercure/Chart.yaml'
+    cmds:
+      - cmd: |
+          if [ -z "{{.MERGE_BASE}}" ]; then
+            echo "version:check:upstream: cannot locate upstream/main." >&2
+            echo "  Run: git fetch upstream main --tags" >&2
+            exit 1
+          fi
+          if [ -z "{{.EXPECTED}}" ]; then
+            echo "version:check:upstream: no v* tag reachable from merge-base {{.MERGE_BASE}}." >&2
+            echo "  Run: git fetch upstream --tags" >&2
+            exit 1
+          fi
+          drift=0
+          for label_value in \
+              "Taskfile.yml:{{.DECLARED_TASKFILE}}" \
+              "Dockerfile:{{.DECLARED_DOCKERFILE}}" \
+              "charts/mercure/Chart.yaml:{{.DECLARED_CHART}}"; do
+            file="${label_value%%:*}"
+            value="${label_value#*:}"
+            if [ "$value" != "{{.EXPECTED}}" ]; then
+              echo "version:check:upstream: DRIFT in $file" >&2
+              echo "  expected: {{.EXPECTED}} (from upstream/main ancestry at {{.MERGE_BASE}})" >&2
+              echo "  found:    $value" >&2
+              drift=1
+            fi
+          done
+          if [ "$drift" -ne 0 ]; then
+            echo "" >&2
+            echo "Run: task version:bump:upstream V={{.EXPECTED}}" >&2
+            echo "Then re-verify: task version:check:upstream" >&2
+            exit 1
+          fi
+          echo "version:check:upstream: OK ({{.EXPECTED}})"
+
+  version:check:upstream:fetch:
+    desc: "Fetch upstream tags then verify (slower, network-dependent)"
+    silent: true
+    cmds:
+      - git fetch upstream main --tags
+      - task: version:check:upstream
+
+  upstream:preview:
+    desc: "Show upstream commits + code-file diff since the declared UPSTREAM_VERSION (read-only)"
+    vars:
+      # MAIN_TAG is the nearest tag on upstream/main — the value upstream:sync
+      # and version:check:upstream both target. LATEST_TAG_ANY is the newest tag
+      # in the repo regardless of branch; under upstream's release-from-
+      # maintenance-branch process (#1256) it can be a patch tag that is NOT on
+      # main, so the two diverge and only MAIN_TAG is a valid sync target.
+      MAIN_TAG:
+        sh: git fetch upstream --tags 2>/dev/null && git describe --tags --match 'v[0-9]*' --abbrev=0 upstream/main 2>/dev/null
+      LATEST_TAG_ANY:
+        sh: git tag -l 'v*' --sort=-v:refname | head -1
+    cmds:
+      - cmd: |
+          echo "Declared in fork:           {{.UPSTREAM_VERSION}}"
+          echo "main tracks (sync target):  {{.MAIN_TAG}}"
+          echo "Latest tag (any branch):    {{.LATEST_TAG_ANY}}"
+          if [ "{{.MAIN_TAG}}" != "{{.LATEST_TAG_ANY}}" ]; then
+            echo ""
+            echo "NOTE: {{.LATEST_TAG_ANY}} is newer than what main tracks ({{.MAIN_TAG}})."
+            echo "      Upstream ships patch releases from maintenance branches (#1256), so"
+            echo "      {{.LATEST_TAG_ANY}} may not be on upstream/main. upstream:sync follows main"
+            echo "      and bumps to {{.MAIN_TAG}}; verify the patch fixes also landed on"
+            echo "      main via the commit list below."
+          fi
+          echo ""
+          echo "Commits since {{.UPSTREAM_VERSION}}:"
+          git log --oneline {{.UPSTREAM_VERSION}}..upstream/main -- ':!docs' ':!.github' ':!gatling' ':!charts' 2>/dev/null || echo "  (none or tag not found locally)"
+          echo ""
+          echo "Changed files (code only):"
+          git diff --stat {{.UPSTREAM_VERSION}}..upstream/main -- '*.go' 'go.*' 2>/dev/null || true
+
+  upstream:sync:
+    desc: "Model-A upstream sync: ff main, rebase fork/main, bump UPSTREAM_VERSION, verify"
+    vars:
+      LATEST_TAG:
+        sh: git fetch upstream --tags 2>/dev/null; git describe --tags --match 'v[0-9]*' --abbrev=0 upstream/main 2>/dev/null
+    preconditions:
+      - sh: test -n "{{.LATEST_TAG}}"
+        msg: "No upstream tag found on upstream/main. Run 'git fetch upstream main --tags'."
+      - sh: test -z "$(git status --porcelain)"
+        msg: "Working directory is dirty. Commit or stash changes first."
+      - sh: test ! -d .git/rebase-merge -a ! -d .git/rebase-apply
+        msg: "Active rebase detected. Resolve and 'git rebase --continue' first."
+    cmds:
+      - git checkout main
+      - git merge --ff-only upstream/main
+      - git checkout fork/main
+      - git rebase main
+      - task: version:bump:upstream
+        vars:
+          V: "{{.LATEST_TAG}}"
+      - task: version:check:upstream
+      - 'echo ""'
+      - 'echo "Synced fork/main onto upstream/main and bumped to {{.LATEST_TAG}}."'
+      - 'echo "Review the diff, run task go:build, then commit the bump."'
+
+  # ============================================
+  # Release lifecycle (redistransport ONLY)
+  # ============================================
+  # The hub ships to an internal Docker registry via `docker:*` /
+  # `up:build`; only the `redistransport` Go module ships via GitHub
+  # releases (tagged `redistransport/vX.Y.Z`).
+  #
+  # Operator: `version:set:rt V=...` → write `## [X.Y.Z]` in
+  # `redistransport/CHANGELOG.md` (no `v` prefix in the heading) →
+  # optionally `redistransport/releases/$V.pre.md` for first-release /
+  # major-bump positioning → commit → `release:create V=...`.
+  #
+  # `tag` + `publish` are split so CI can `publish` on a tag-push event
+  # using `GH_TOKEN` for `gh auth`; operator signs locally. Tasks below
+  # are preconditions + one `bash scripts/release.sh ...` invocation.
+  # Requires `gh` ≥ 2.46.
+  # ============================================
+
+  release:tag:
+    desc: "Sign + push the redistransport tag (V=v0.0.1 [REMOTE=origin])"
+    requires:
+      vars: [V]
+    env:
+      V: '{{.V}}'
+      REMOTE: '{{.REMOTE | default "origin"}}'
+    preconditions:
+      # REMOTE-name validation FIRST. Without this, `REMOTE='--upload-pack=cmd'`
+      # is parsed by `git ls-remote` as a flag and executes `cmd` locally.
+      - sh: '[[ "$REMOTE" =~ ^[A-Za-z][A-Za-z0-9._/-]*$ ]]'
+        msg: 'REMOTE must be a simple git remote name (got: {{.REMOTE | default "origin"}})'
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be vX.Y.Z[-suffix] (got: {{.V}})'
+      # RT_VERSION resolves to the form used by `redistransport/Taskfile.yml`
+      # (no `v` prefix — used in the binary's version ldflag). The git tag
+      # form (with `v`) is the operator's V= input. Strip `v` from V for
+      # comparison; the msg shows the operator-facing `v`-prefixed form.
+      - sh: 'test "${V#v}" = "{{.RT_VERSION}}"'
+        msg: 'V ({{.V}}) does not match RT_VERSION (v{{.RT_VERSION}}). Bump first via `task version:set:rt V=...`.'
+      - sh: '[ "$(git rev-parse --abbrev-ref HEAD)" = "fork/main" ]'
+        msg: 'Release must run from the fork/main branch.'
+      - sh: 'test -z "$(git status --porcelain)"'
+        msg: 'Working tree dirty. Commit or stash before releasing. Run `git status` to see dirty paths.'
+      # CHANGELOG section must exist BEFORE we sign and push a tag. Without
+      # this, `release:tag` happily produces a tag that `release:publish`
+      # then rejects, leaving an orphan signed tag that requires destructive
+      # cleanup via `release:delete`.
+      - sh: 'test -f redistransport/CHANGELOG.md'
+        msg: 'redistransport/CHANGELOG.md not found.'
+      - sh: 'awk -v v="$V" -v mode=check -f scripts/extract-changelog-section.awk redistransport/CHANGELOG.md'
+        msg: 'No release notes section found for {{.V}} in redistransport/CHANGELOG.md — add a "## [X.Y.Z] — date" section (no leading `v`) first.'
+      - sh: 'test -z "$(git tag --list "redistransport/$V")"'
+        msg: 'Local tag redistransport/{{.V}} already exists. Use release:delete first.'
+      - sh: |
+          out=$(git ls-remote --tags "$REMOTE" "refs/tags/redistransport/$V" 2>&1) \
+            || { echo "git ls-remote failed: $out" >&2; exit 1; }
+          test -z "$out"
+        msg: 'Remote tag redistransport/{{.V}} already exists on `{{.REMOTE | default "origin"}}` (run release:delete first), or the remote is unreachable.'
+      # Accept either explicit `user.signingkey` or `commit.gpgsign=true`
+      # (operators using the default GPG key via gpg-agent may not set
+      # signingkey explicitly).
+      - sh: 'test -n "$(git config --get user.signingkey)" || [ "$(git config --get commit.gpgsign)" = "true" ]'
+        msg: 'No `user.signingkey` and `commit.gpgsign` is not true — `git tag -as` will fail. Load your signing key (`ssh-add` / `gpg --list-secret-keys`); do NOT switch the script to unsigned `git tag -a` — that silently regresses release-provenance for every future release.'
+      # gh auth is not used by `release:tag` itself, but the operator's
+      # intent is to ship a release. Failing here saves a `release:delete`
+      # recovery when `release:publish` would have failed minutes later
+      # with auth-expired error after the tag was already signed.
+      - sh: 'gh auth status >/dev/null 2>&1'
+        msg: "gh CLI not authenticated. Run 'gh auth login' first — release:publish will need it after release:tag."
+    cmds:
+      - bash scripts/release.sh tag
+
+  release:publish:
+    desc: "Create the GitHub release from the pushed tag + spliced notes (V=v0.0.1 [REMOTE=origin])"
+    requires:
+      vars: [V]
+    env:
+      V: '{{.V}}'
+      REMOTE: '{{.REMOTE | default "origin"}}'
+    preconditions:
+      - sh: '[[ "$REMOTE" =~ ^[A-Za-z][A-Za-z0-9._/-]*$ ]]'
+        msg: 'REMOTE must be a simple git remote name (got: {{.REMOTE | default "origin"}})'
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be vX.Y.Z[-suffix] (got: {{.V}})'
+      - sh: 'test "${V#v}" = "{{.RT_VERSION}}"'
+        msg: 'V ({{.V}}) does not match RT_VERSION (v{{.RT_VERSION}}). Bump first via `task version:set:rt V=...`.'
+      - sh: 'test -f redistransport/CHANGELOG.md'
+        msg: 'redistransport/CHANGELOG.md not found.'
+      - sh: 'awk -v v="$V" -v mode=check -f scripts/extract-changelog-section.awk redistransport/CHANGELOG.md'
+        msg: 'No release notes section found for {{.V}} in redistransport/CHANGELOG.md — add a "## [X.Y.Z] — date" section first.'
+      # Catch untracked AND uncommitted edits to either notes source — the
+      # plain `git diff` form silently passes for untracked files, which
+      # would publish a release body that exists only on the operator's
+      # disk and can't be reproduced from any git state.
+      - sh: 'test -z "$(git status --porcelain -- redistransport/CHANGELOG.md "redistransport/releases/$V.pre.md")"'
+        msg: 'CHANGELOG.md or `redistransport/releases/{{.V}}.pre.md` has uncommitted/untracked changes — commit first so the published release matches a recorded git state.'
+      - sh: 'gh auth status >/dev/null 2>&1'
+        msg: "gh CLI not authenticated. Run 'gh auth login' first."
+      # Tag must already exist on the remote — publish uses --verify-tag,
+      # but checking here gives a clearer error than gh's "tag doesn't exist".
+      - sh: |
+          out=$(git ls-remote --tags "$REMOTE" "refs/tags/redistransport/$V" 2>&1) \
+            || { echo "git ls-remote failed: $out" >&2; exit 1; }
+          test -n "$out"
+        msg: 'Remote tag redistransport/{{.V}} not found on `{{.REMOTE | default "origin"}}`. Run `task release:tag V={{.V}}` first.'
+    cmds:
+      - bash scripts/release.sh publish
+
+  release:create:
+    desc: "Release redistransport: tag + publish (V=v0.0.1 [REMOTE=origin])"
+    requires:
+      vars: [V]
+    env:
+      V: '{{.V}}'
+      REMOTE: '{{.REMOTE | default "origin"}}'
+    preconditions:
+      - sh: '[[ "$REMOTE" =~ ^[A-Za-z][A-Za-z0-9._/-]*$ ]]'
+        msg: 'REMOTE must be a simple git remote name (got: {{.REMOTE | default "origin"}})'
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be vX.Y.Z[-suffix] (got: {{.V}})'
+      - sh: 'test "${V#v}" = "{{.RT_VERSION}}"'
+        msg: 'V ({{.V}}) does not match RT_VERSION (v{{.RT_VERSION}}). Bump first via `task version:set:rt V=...`.'
+      - sh: '[ "$(git rev-parse --abbrev-ref HEAD)" = "fork/main" ]'
+        msg: 'Release must run from the fork/main branch.'
+      - sh: 'test -z "$(git status --porcelain)"'
+        msg: 'Working tree dirty. Commit or stash before releasing. Run `git status` to see dirty paths.'
+      - sh: 'test -f redistransport/CHANGELOG.md'
+        msg: 'redistransport/CHANGELOG.md not found.'
+      - sh: 'awk -v v="$V" -v mode=check -f scripts/extract-changelog-section.awk redistransport/CHANGELOG.md'
+        msg: 'No release notes section found for {{.V}} in redistransport/CHANGELOG.md — add a "## [X.Y.Z] — date" section first.'
+      - sh: 'test -z "$(git tag --list "redistransport/$V")"'
+        msg: 'Local tag redistransport/{{.V}} already exists. Use release:delete first.'
+      - sh: |
+          out=$(git ls-remote --tags "$REMOTE" "refs/tags/redistransport/$V" 2>&1) \
+            || { echo "git ls-remote failed: $out" >&2; exit 1; }
+          test -z "$out"
+        msg: 'Remote tag redistransport/{{.V}} already exists on `{{.REMOTE | default "origin"}}` (run release:delete first), or the remote is unreachable.'
+      - sh: 'gh auth status >/dev/null 2>&1'
+        msg: "gh CLI not authenticated. Run 'gh auth login' first."
+      - sh: 'test -n "$(git config --get user.signingkey)" || [ "$(git config --get commit.gpgsign)" = "true" ]'
+        msg: 'No `user.signingkey` and `commit.gpgsign` is not true — `git tag -as` will fail. Load your signing key (`ssh-add` / `gpg --list-secret-keys`); do NOT switch the script to unsigned `git tag -a`.'
+    cmds:
+      - bash scripts/release.sh create
+
+  release:update:
+    desc: "Re-splice redistransport release notes (prelude + CHANGELOG) and edit the GitHub release (V=v0.0.1 [REMOTE=origin])"
+    requires:
+      vars: [V]
+    env:
+      V: '{{.V}}'
+      REMOTE: '{{.REMOTE | default "origin"}}'
+    preconditions:
+      - sh: '[[ "$REMOTE" =~ ^[A-Za-z][A-Za-z0-9._/-]*$ ]]'
+        msg: 'REMOTE must be a simple git remote name (got: {{.REMOTE | default "origin"}})'
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be vX.Y.Z[-suffix] (got: {{.V}})'
+      - sh: 'gh auth status >/dev/null 2>&1'
+        msg: "gh CLI not authenticated. Run 'gh auth login' first."
+      - sh: 'test -f redistransport/CHANGELOG.md'
+        msg: 'redistransport/CHANGELOG.md not found.'
+      - sh: 'awk -v v="$V" -v mode=check -f scripts/extract-changelog-section.awk redistransport/CHANGELOG.md'
+        msg: 'No release notes section for {{.V}} in redistransport/CHANGELOG.md.'
+      # Use the script's REPO-aware gh for the release-existence check —
+      # the bare `gh release view` falls back to gh's default-repo heuristic
+      # and on a fork with an `upstream` remote silently queries upstream.
+      - sh: |
+          # Strip .git first to avoid the in-regex (\.git)?$ alternative
+          # matching .git as part of the captured name when `.` is in the
+          # char class (legitimate for `org.io`-style repo names).
+          url=$(git remote get-url "$REMOTE" 2>/dev/null)
+          url=${url%.git}
+          REPO=$(printf "%s" "$url" | sed -nE \
+            -e 's#^git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\1#p' \
+            -e 's#^ssh://git@github\.com(:[0-9]+)?/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\2#p' \
+            -e 's#^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\1#p')
+          [ -n "$REPO" ] || { echo "could not derive repo from $REMOTE" >&2; exit 1; }
+          gh release view --repo "$REPO" "redistransport/$V" >/dev/null 2>&1
+        msg: 'Release redistransport/{{.V}} does not exist on the fork. Use release:create first.'
+      # Don't publish uncommitted OR untracked edits to either notes source.
+      # `git diff` silently ignores untracked files; `git status --porcelain`
+      # catches all three states (untracked, unstaged, staged).
+      - sh: 'test -z "$(git status --porcelain -- redistransport/CHANGELOG.md "redistransport/releases/$V.pre.md")"'
+        msg: 'CHANGELOG.md or `redistransport/releases/{{.V}}.pre.md` has uncommitted/untracked changes — commit first so the published release matches a recorded git state.'
+    cmds:
+      - bash scripts/release.sh update
+
+  release:delete:
+    desc: "Delete redistransport release + tag (V=v0.0.1 [REMOTE=origin])"
+    requires:
+      vars: [V]
+    env:
+      V: '{{.V}}'
+      REMOTE: '{{.REMOTE | default "origin"}}'
+    preconditions:
+      - sh: '[[ "$REMOTE" =~ ^[A-Za-z][A-Za-z0-9._/-]*$ ]]'
+        msg: 'REMOTE must be a simple git remote name (got: {{.REMOTE | default "origin"}})'
+      - sh: '[[ "$V" =~ {{.TAG_VERSION_REGEX}} ]]'
+        msg: 'V must be vX.Y.Z[-suffix] (got: {{.V}}). Note: passing `HEAD` or other refs is rejected here.'
+      - sh: 'gh auth status >/dev/null 2>&1'
+        msg: "gh CLI not authenticated. Run 'gh auth login' first."
+      - sh: |
+          # Strip .git first to avoid the in-regex (\.git)?$ alternative
+          # matching .git as part of the captured name when `.` is in the
+          # char class (legitimate for `org.io`-style repo names).
+          url=$(git remote get-url "$REMOTE" 2>/dev/null)
+          url=${url%.git}
+          REPO=$(printf "%s" "$url" | sed -nE \
+            -e 's#^git@github\.com:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\1#p' \
+            -e 's#^ssh://git@github\.com(:[0-9]+)?/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\2#p' \
+            -e 's#^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$#\1#p')
+          [ -n "$REPO" ] || { echo "could not derive repo from $REMOTE" >&2; exit 1; }
+          gh release view --repo "$REPO" "redistransport/$V" >/dev/null 2>&1 && exit 0
+          git rev-parse "refs/tags/redistransport/$V" >/dev/null 2>&1 && exit 0
+          out=$(git ls-remote --tags "$REMOTE" "refs/tags/redistransport/$V" 2>&1) || { echo "git ls-remote failed: $out" >&2; exit 1; }
+          test -n "$out"
+        msg: 'No release, local tag, or remote tag redistransport/{{.V}} found — nothing to delete.'
+      - sh: 'gh release delete --help 2>&1 | grep -q -- "--cleanup-tag"'
+        msg: 'gh CLI 2.46+ required.'
+    cmds:
+      - bash scripts/release.sh delete
+
+  # ============================================
+  # Info
+  # ============================================
+  info:
+    desc: Show service + upstream + transport versions and key URLs
+    cmds:
+      - |
+        printf "Service:   %s %s\nUpstream:  mercure %s\nTransport: redistransport %s\nImage:     %s\n\nURLs:\n  Debug UI (HTTPS): %s\n  Debug UI (HTTP):  %s\n  Metrics:          %s\n  Prometheus:       %s\n  Grafana:          %s\n  RedisInsight:     %s\n" \
+          "{{.SVC_NAME}}" "{{.SVC_VERSION}}" "{{.UPSTREAM_VERSION}}" "{{.RT_VERSION}}" "{{.SVC_IMAGE}}" \
+          "{{.MERCURE_UI}}" "{{.MERCURE_HTTP_UI}}" "{{.METRICS_URL}}" "{{.PROMETHEUS_URL}}" "{{.GRAFANA_URL}}" "{{.REDISINSIGHT_URL}}"

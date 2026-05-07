@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,34 +21,36 @@ import (
 // Serve starts the HTTP server.
 //
 // Deprecated: use the Caddy server module or the standalone library instead.
-func (h *Hub) Serve(ctx context.Context) { //nolint:funlen
+func (h *Hub) Serve(ctx context.Context) {
 	addr := h.config.GetString("addr")
 
-	h.server = &http.Server{
+	server := &http.Server{
 		Addr:              addr,
 		Handler:           h.baseHandler(),
 		ReadTimeout:       h.config.GetDuration("read_timeout"),
 		ReadHeaderTimeout: h.config.GetDuration("read_header_timeout"),
 		WriteTimeout:      h.config.GetDuration("write_timeout"),
 	}
+	h.server.Store(server)
 
 	if _, ok := h.metrics.(*PrometheusMetrics); ok {
 		addr := h.config.GetString("metrics_addr")
 
-		h.metricsServer = &http.Server{
+		metricsServer := &http.Server{
 			Addr:              addr,
 			Handler:           h.metricsHandler(),
 			ReadTimeout:       h.config.GetDuration("read_timeout"),
 			ReadHeaderTimeout: h.config.GetDuration("read_header_timeout"),
 			WriteTimeout:      h.config.GetDuration("write_timeout"),
 		}
+		h.metricsServer.Store(metricsServer)
 
 		if h.logger.Enabled(ctx, slog.LevelInfo) {
 			h.logger.LogAttrs(ctx, slog.LevelInfo, "Mercure metrics started", slog.String("addr", addr))
 		}
 
 		go func() {
-			if err := h.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && h.logger.Enabled(ctx, slog.LevelError) { //nolint:gosec
+			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) && h.logger.Enabled(ctx, slog.LevelError) {
 				h.logger.LogAttrs(ctx, slog.LevelError, "Mercure metrics server error", slog.Any("error", err))
 			}
 		}()
@@ -64,12 +65,12 @@ func (h *Hub) Serve(ctx context.Context) { //nolint:funlen
 
 	var err error
 
-	if !acme && certFile == "" && keyFile == "" { //nolint:nestif
+	if !acme && certFile == "" && keyFile == "" {
 		if h.logger.Enabled(ctx, slog.LevelInfo) {
 			h.logger.LogAttrs(ctx, slog.LevelInfo, "Mercure started", slog.String("protocol", "http"), slog.String("addr", addr))
 		}
 
-		err = h.server.ListenAndServe()
+		err = server.ListenAndServe()
 	} else {
 		// TLS
 		if acme {
@@ -83,11 +84,10 @@ func (h *Hub) Serve(ctx context.Context) { //nolint:funlen
 				certManager.Cache = autocert.DirCache(acmeCertDir)
 			}
 
-			h.server.TLSConfig = certManager.TLSConfig()
+			server.TLSConfig = certManager.TLSConfig()
 
 			// Mandatory for Let's Encrypt http-01 challenge
 			go func() {
-				//nolint:gosec
 				if err := http.ListenAndServe(h.config.GetString("acme_http01_addr"), certManager.HTTPHandler(nil)); err != nil && !errors.Is(err, http.ErrServerClosed) && h.logger.Enabled(ctx, slog.LevelError) {
 					h.logger.LogAttrs(ctx, slog.LevelError, "Error running HTTP endpoint", slog.Any("error", err))
 				}
@@ -98,7 +98,7 @@ func (h *Hub) Serve(ctx context.Context) { //nolint:funlen
 			h.logger.LogAttrs(ctx, slog.LevelInfo, "Mercure started", slog.String("protocol", "https"), slog.String("addr", addr))
 		}
 
-		err = h.server.ListenAndServeTLS(certFile, keyFile)
+		err = server.ListenAndServeTLS(certFile, keyFile)
 	}
 
 	if !errors.Is(err, http.ErrServerClosed) && h.logger.Enabled(ctx, slog.LevelError) {
@@ -112,7 +112,8 @@ func (h *Hub) Serve(ctx context.Context) { //nolint:funlen
 func (h *Hub) listenShutdown(ctx context.Context) <-chan struct{} {
 	idleConnsClosed := make(chan struct{})
 
-	h.server.RegisterOnShutdown(func() {
+	server := h.server.Load()
+	server.RegisterOnShutdown(func() {
 		select {
 		case <-idleConnsClosed:
 		default:
@@ -125,12 +126,12 @@ func (h *Hub) listenShutdown(ctx context.Context) <-chan struct{} {
 		signal.Notify(sigint, os.Interrupt)
 		<-sigint
 
-		if err := h.server.Shutdown(ctx); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+		if err := server.Shutdown(ctx); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
 			h.logger.LogAttrs(ctx, slog.LevelError, "Unexpected error during server shutdown", slog.Any("error", err))
 		}
 
-		if h.metricsServer != nil {
-			if err := h.metricsServer.Shutdown(ctx); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
+		if metricsServer := h.metricsServer.Load(); metricsServer != nil {
+			if err := metricsServer.Shutdown(ctx); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
 				h.logger.LogAttrs(ctx, slog.LevelError, "Unexpected error during metrics server shutdown", slog.Any("error", err))
 			}
 		}
@@ -152,7 +153,7 @@ func (h *Hub) listenShutdown(ctx context.Context) <-chan struct{} {
 // chainHandlers configures and chains handlers.
 //
 // Deprecated: use the Caddy server module or the standalone library instead.
-func (h *Hub) chainHandlers() http.Handler { //nolint:funlen
+func (h *Hub) chainHandlers() http.Handler {
 	r := mux.NewRouter()
 	h.registerSubscriptionHandlers(r)
 
@@ -166,12 +167,7 @@ func (h *Hub) chainHandlers() http.Handler { //nolint:funlen
 	}
 
 	if h.ui {
-		public, err := fs.Sub(uiContent, "public")
-		if err != nil {
-			panic(err)
-		}
-
-		r.PathPrefix("/").Handler(http.FileServer(http.FS(public)))
+		r.PathPrefix("/").Handler(http.FileServer(http.FS(publicFS(h.logger))))
 
 		csp += " mercure.rocks cdn.jsdelivr.net"
 	} else {
@@ -193,7 +189,7 @@ func (h *Hub) chainHandlers() http.Handler { //nolint:funlen
 		corsHandler = cors.New(cors.Options{
 			AllowedOrigins:   h.corsOrigins,
 			AllowCredentials: true,
-			AllowedHeaders:   []string{"authorization", "cache-control", "last-event-id"},
+			AllowedHeaders:   h.corsAllowedHeaders(),
 		}).Handler(r)
 	} else {
 		corsHandler = r

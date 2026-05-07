@@ -15,17 +15,26 @@ type AppVersionInfo struct {
 	GoVersion    string
 	OS           string
 	Architecture string
+	// UpstreamVersion is the dunglas/mercure tag this fork was built against.
+	// Populated via -ldflags -X common.upstreamVersion=… by the Taskfile and
+	// Dockerfile. Empty when built outside the fork's build pipeline.
+	UpstreamVersion string
 }
 
 var AppVersion AppVersionInfo //nolint:gochecknoglobals
 
-const dev = "dev"
+// devVersion is the placeholder Version when no -ldflags -X
+// common.version=… was supplied (in-tree `go test`, ad-hoc `go run`).
+// init() promotes a debug.ReadBuildInfo() Main.Version into version
+// when this sentinel is observed.
+const devVersion = "dev"
 
 // these variables are dynamically set at build.
 var (
-	version   = dev
-	buildDate = "" //nolint:gochecknoglobals
-	commit    = "" //nolint:gochecknoglobals
+	version         = devVersion
+	buildDate       = "" //nolint:gochecknoglobals
+	commit          = "" //nolint:gochecknoglobals
+	upstreamVersion = "" //nolint:gochecknoglobals
 )
 
 func (v *AppVersionInfo) Shortline() string {
@@ -45,7 +54,7 @@ func (v *AppVersionInfo) Shortline() string {
 func (v *AppVersionInfo) ChangelogURL() string {
 	const path = "https://github.com/dunglas/mercure"
 
-	if v.Version == dev {
+	if v.Version == devVersion {
 		return path + "/releases/latest"
 	}
 
@@ -54,12 +63,13 @@ func (v *AppVersionInfo) ChangelogURL() string {
 
 func (v *AppVersionInfo) NewMetricsCollector() *prometheus.GaugeVec {
 	labels := map[string]string{
-		"version":      v.Version,
-		"built_at":     v.BuildDate,
-		"commit":       v.Commit,
-		"go_version":   v.GoVersion,
-		"os":           v.OS,
-		"architecture": v.Architecture,
+		"version":          v.Version,
+		"built_at":         v.BuildDate,
+		"commit":           v.Commit,
+		"go_version":       v.GoVersion,
+		"os":               v.OS,
+		"architecture":     v.Architecture,
+		"upstream_version": v.UpstreamVersion,
 	}
 
 	labelNames := make([]string, 0, len(labels))
@@ -80,7 +90,7 @@ func (v *AppVersionInfo) NewMetricsCollector() *prometheus.GaugeVec {
 }
 
 func init() { //nolint:gochecknoinits
-	if version == dev {
+	if version == devVersion {
 		info, ok := debug.ReadBuildInfo()
 		if ok && info.Main.Version != "(devel)" && info.Main.Version != "" {
 			version = info.Main.Version
@@ -90,11 +100,12 @@ func init() { //nolint:gochecknoinits
 	version = strings.TrimPrefix(version, "v")
 
 	AppVersion = AppVersionInfo{
-		Version:      version,
-		BuildDate:    buildDate,
-		Commit:       commit,
-		GoVersion:    runtime.Version(),
-		OS:           runtime.GOOS,
-		Architecture: runtime.GOARCH,
+		Version:         version,
+		BuildDate:       buildDate,
+		Commit:          commit,
+		GoVersion:       runtime.Version(),
+		OS:              runtime.GOOS,
+		Architecture:    runtime.GOARCH,
+		UpstreamVersion: upstreamVersion,
 	}
 }

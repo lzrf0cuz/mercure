@@ -1,0 +1,98 @@
+version: "2"
+run:
+  tests: true
+linters:
+  default: all
+  disable:
+    - canonicalheader
+    - cyclop
+    - depguard
+    - exhaustruct
+    - forcetypeassert
+    # gomodguard is deprecated since v2.12.0 (replaced by gomodguard_v2);
+    # we don't restrict module imports, so disable both rather than migrate.
+    - gomodguard
+    - gomodguard_v2
+    # importas is in the active set but would need an `alias:` list to be
+    # useful — we don't enforce import aliases in this module, so disable it.
+    # Without this, golangci-lint emits an info-level advisory on every run.
+    - importas
+    - lll
+    - mnd
+    - musttag
+    - noinlineerr
+    - nonamedreturns
+    - paralleltest
+    - tagliatelle
+    - testableexamples
+    - testpackage
+    - varnamelen
+    # wsl_v5 is the successor to wsl (deprecated in golangci-lint v2.2.0).
+    - wsl
+  settings:
+    gomoddirectives:
+      replace-local: true
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - generic
+        - github.com/dunglas/mercure.Codec
+        - github.com/lzrf0cuz/mercure/redistransport.Codec
+        # Prometheus client_golang types are pure interfaces with unexported
+        # concrete implementations — returning concretes is not possible.
+        - github.com/prometheus/client_golang/prometheus.Counter
+        # trace.Span is an interface by design (OTel SDK); the local
+        # startSpan helper has to return it — matches the hub's allowlist.
+        - go.opentelemetry.io/otel/trace.Span
+        # ReadOnlySpan is the OTel SDK's interface for inspecting ended
+        # spans — used by tracer_test helpers to find spans by name.
+        - go.opentelemetry.io/otel/sdk/trace.ReadOnlySpan
+    spancheck:
+      # startSpan returns the span unended on purpose; the caller owns
+      # span.End. Register the helper so spancheck doesn't flag the
+      # return as a leak — matches the hub's spancheck config.
+      extra-start-span-signatures:
+        - "github.com/lzrf0cuz/mercure/redistransport.startSpan:opentelemetry"
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - funlen
+          - gochecknoglobals
+          - goconst
+          - godox
+          - noctx
+          - wrapcheck
+        path: _test\.go
+      # Close() deliberately ignores the caller ctx to dodge a Caddy framework
+      # bug: during `caddy validate`, TransportDestructor.Destruct invokes
+      # Close(caddy.ActiveContext()), which returns a zero-value caddy.Context
+      # whose embedded context.Context is nil. go-redis panics with a nil
+      # pointer dereference on ctx.Done(). The rule is right in general; our
+      # case is genuinely adversarial. See Close()'s doc comment and
+      # TestCloseIgnoresCallerContext for the pinned contract.
+      - linters: [contextcheck]
+        path: redis\.go
+        source: "func \\(t \\*RedisTransport\\) Close"
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports

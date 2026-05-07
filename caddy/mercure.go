@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -29,19 +32,18 @@ import (
 const defaultHubURL = "/.well-known/mercure"
 
 var (
-	// AllowNoPublish allows not setting the publisher JWT, and then disable the publish endpoint.
+	// AllowNoPublish, when true, allows not setting the publisher JWT and
+	// disables the publish endpoint. Usually set in the init() function of Go
+	// applications publishing programmatically via mercure.Publish() directly.
 	//
-	// EXPERIMENTAL.
-	//
-	// It is usually set to true in the init() function of Go applications allowing to publish programmatically by
-	// calling mercure.Publish() directly.
+	// EXPERIMENTAL — surface may change.
 	AllowNoPublish bool //nolint:gochecknoglobals
 
 	ErrCompatibility = errors.New("compatibility mode only supports protocol version 7")
 
 	// hubs is a list of registered Mercure hubs, the key is the top-most subroute.
 	hubs   = make(map[caddy.Module]*hubInfo) //nolint:gochecknoglobals
-	hubsMu sync.Mutex                        //nolint:gochecknoglobals
+	hubsMu sync.Mutex                        //nolint:gochecknoglobals // guards the hubs registry; init-time singleton.
 )
 
 type hubInfo struct {
@@ -58,7 +60,7 @@ func init() { //nolint:gochecknoinits
 
 // FindHub finds the Mercure hub configured for the current route.
 //
-// EXPERIMENTAL.
+// EXPERIMENTAL — surface may change.
 func FindHub(modules []caddy.Module) *mercure.Hub {
 	hubsMu.Lock()
 	defer hubsMu.Unlock()
@@ -91,8 +93,10 @@ type TopicSelectorCacheConfig struct {
 }
 
 // Mercure implements a Mercure hub as a Caddy module. Mercure is a protocol allowing to push data updates to web browsers and other HTTP clients in a convenient, fast, reliable and battery-efficient way.
+//
+//nolint:recvcheck // Caddy module convention: CaddyModule() uses a value receiver so caddy.RegisterModule receives a Module value, while every behavior method takes *Mercure to mutate state. Mixing is required by the framework.
 type Mercure struct {
-	deprecatedTransport
+	deprecatedTransport //nolint:embeddedstructfieldcheck // build-tagged shim; the real fields live in mercure_deprecated_transport.go.
 
 	// Human-readable name for this hub, used in health check endpoints and metrics.
 	Name string `json:"name,omitempty"`
@@ -118,6 +122,13 @@ type Mercure struct {
 	// Frequency of the heartbeat, defaults to 40s.
 	Heartbeat *caddy.Duration `json:"heartbeat,omitempty"`
 
+	// Maximum duration of a single dispatch, disabled by default. The publish
+	// path detaches dispatch from the publisher's request so a mid-publish
+	// disconnect does not abort the write; this bounds that detached dispatch so
+	// a stalled transport cannot block indefinitely. On timeout the write may
+	// still have committed, so the publisher receives 504.
+	PublishTimeout *caddy.Duration `json:"publish_timeout,omitempty"`
+
 	// JWT key and signing algorithm to use for publishers.
 	PublisherJWT JWTConfig `json:"publisher_jwt,omitzero"`
 
@@ -129,6 +140,11 @@ type Mercure struct {
 
 	// JWK Set URL to use for subscribers.
 	SubscriberJWKSURL string `json:"subscriber_jwks_url,omitempty"`
+
+	// Bindings requiring a JWT claim to agree with an HTTP header, e.g. the "tenants"
+	// claim with the "Tenant-ID" header. Every applicable binding must hold or the
+	// request is rejected with a 401.
+	ClaimHeaderBindings []ClaimHeaderBindingConfig `json:"require_claim_headers,omitempty"`
 
 	// Origins allowed to publish updates
 	PublishOrigins []string `json:"publish_origins,omitempty"`
@@ -143,6 +159,12 @@ type Mercure struct {
 	TopicSelectorCache *TopicSelectorCacheConfig `json:"cache,omitempty"`
 
 	SubscriberListCacheSize *int `json:"subscriber_list_cache_size,omitempty"`
+
+	// Per-subscriber out-channel and pre-ready queue capacity, defaults to 1000.
+	// Each connected subscriber commits this many update slots up front, so a
+	// large fleet may want it lower to cut memory. 0 keeps the default; a
+	// positive value below 16 is rejected.
+	SubscriberOutBuffer *int `json:"subscriber_out_buffer,omitempty"`
 
 	// The name of the authorization cookie. Defaults to "mercureAuthorization".
 	CookieName string `json:"cookie_name,omitempty"`
@@ -175,8 +197,33 @@ func (s stoppingHandlerFunc) Handle(_ context.Context, _ caddy.Event) error {
 }
 
 //nolint:wrapcheck
-func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,gocognit,gocyclo,maintidx
-	metrics := mercure.NewPrometheusMetrics(ctx.GetMetricsRegistry())
+func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,gocognit,gocyclo,maintidx // wires hub + transport + JWT + JWKS + cache + metrics + lifecycle hooks; splitting fragments the lifecycle without reducing real complexity.
+	// caddy/v2 quirk (verified against v2.11.3).
+	//
+	// caddy.Context embeds context.Context plus a non-exported metricsRegistry
+	// field. caddy.Context.WithValue (called below to thread Subscriptions /
+	// WriteTimeout / SubscriberListCacheSize) returns a NEW caddy.Context that
+	// wraps the embedded context but does NOT copy the metricsRegistry field
+	// — see context.go:WithValue, which constructs a fresh Context literal
+	// omitting the field. The derived ctx.GetMetricsRegistry() therefore
+	// returns nil. Capture the real registry BEFORE any WithValue call.
+	//
+	// Removing this capture (or moving it after the first WithValue) silently
+	// detaches transport metrics: the transport receives a nil registerer,
+	// RegisterMetricsWith no-ops, and /metrics scrapes find no transport-side
+	// series with no error to surface the problem.
+	//
+	// The bindTransportMetrics → RegisterMetricsWith path that consumes
+	// metricsRegistry is exercised end-to-end against a real
+	// *redistransport.RedisTransport in TestBindTransportMetricsRealRedisTransport
+	// (caddy/transport_redis_test.go), which asserts mercure_redis_* series
+	// land on the registry. That test does NOT exercise this Provision path
+	// directly — it constructs the transport in isolation and calls
+	// bindTransportMetrics — so a refactor that moved the capture below
+	// WithValue would not be caught by it. The defensive capture itself is
+	// the regression guard.
+	metricsRegistry := ctx.GetMetricsRegistry()
+	metrics := mercure.NewPrometheusMetrics(metricsRegistry)
 
 	if err := m.populateJWTConfig(); err != nil {
 		return err
@@ -237,6 +284,10 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 		transport = mod.(Transport).GetTransport()
 	}
 
+	if err := bindTransportMetrics(transport, metricsRegistry, m.logger); err != nil {
+		return err
+	}
+
 	opts := []mercure.Option{
 		mercure.WithLogger(m.logger),
 		mercure.WithTopicSelectorStore(tss),
@@ -271,6 +322,15 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 		opts = append(opts, mercure.WithSubscriberJWT([]byte(m.SubscriberJWT.Key), m.SubscriberJWT.Alg))
 	}
 
+	bindings, err := m.claimHeaderBindings()
+	if err != nil {
+		return err
+	}
+
+	if len(bindings) > 0 {
+		opts = append(opts, mercure.WithClaimHeaderBindings(bindings...))
+	}
+
 	if m.Anonymous {
 		opts = append(opts, mercure.WithAnonymous())
 	}
@@ -297,6 +357,14 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	if d := m.Heartbeat; d != nil {
 		opts = append(opts, mercure.WithHeartbeat(time.Duration(*d)))
+	}
+
+	if d := m.PublishTimeout; d != nil {
+		opts = append(opts, mercure.WithPublishTimeout(time.Duration(*d)))
+	}
+
+	if m.SubscriberOutBuffer != nil {
+		opts = append(opts, mercure.WithSubscriberOutBuffer(*m.SubscriberOutBuffer))
 	}
 
 	if len(m.PublishOrigins) > 0 {
@@ -346,9 +414,9 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 	hubsMu.Lock()
 	defer hubsMu.Unlock()
 
-	for _, m := range ctx.Modules() {
-		if _, ok := m.(*caddyhttp.Subroute); ok {
-			hubs[m] = info
+	for _, mod := range ctx.Modules() {
+		if _, ok := mod.(*caddyhttp.Subroute); ok {
+			hubs[mod] = info
 			found = true
 
 			break
@@ -427,6 +495,11 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 
 			case "heartbeat":
 				if m.Heartbeat, err = parseDurationParameter(d); err != nil {
+					return err
+				}
+
+			case "publish_timeout":
+				if m.PublishTimeout, err = parseDurationParameter(d); err != nil {
 					return err
 				}
 
@@ -521,6 +594,13 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 
 				size, err := strconv.Atoi(d.Val())
 				if err != nil {
+					// Overflow on this platform (size > math.MaxInt) lands as
+					// strconv.ErrRange; wrap with the typed sentinel so the
+					// Caddyfile-overflow test (errors.Is) keeps its contract.
+					if errors.Is(err, strconv.ErrRange) {
+						return d.WrapErr(fmt.Errorf("%w: %s", ErrSubscriberListCacheSizeOverflow, d.Val()))
+					}
+
 					return d.WrapErr(err)
 				}
 
@@ -529,6 +609,22 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 				}
 
 				m.SubscriberListCacheSize = &size
+
+			case "subscriber_out_buffer":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				size, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.WrapErr(err)
+				}
+
+				if size != 0 && size < mercure.MinSubscriberOutBuffer {
+					return d.Errf("subscriber_out_buffer must be 0 (use the default) or at least %d, got %d", mercure.MinSubscriberOutBuffer, size)
+				}
+
+				m.SubscriberOutBuffer = &size
 
 			case "cookie_name":
 				if !d.NextArg() {
@@ -552,6 +648,19 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 				}
 
 				m.ProtocolVersionCompatibility = v
+
+			case "require_claim_header":
+				cfg, err := parseRequireClaimHeader(d)
+				if err != nil {
+					return err
+				}
+
+				m.ClaimHeaderBindings = append(m.ClaimHeaderBindings, cfg)
+
+			default:
+				// Without this, a misspelled directive is silently ignored — which for a
+				// security directive such as require_claim_header means failing open.
+				return d.Errf("unrecognized mercure subdirective %q", d.Val())
 			}
 		}
 	}
@@ -595,12 +704,39 @@ func (m *Mercure) populateJWTConfig() error {
 	return nil
 }
 
+// maxJWKSetFileBytes caps the size of a `file://`-loaded JWK Set. JWKS files
+// are typically <10 KB; 1 MiB leaves room for unusually large key bundles
+// without letting a misconfigured directive read a giant or special file.
+const maxJWKSetFileBytes = 1 << 20
+
+// jwksHTTPFetchTimeout bounds the synchronous first fetch of an HTTP(S) JWK
+// Set at provision time. Without it the fail-fast switch below would let a
+// slow or blackholing JWKS endpoint hang Caddy config load indefinitely
+// (keyfunc's default is 1 minute, applied per URL).
+const jwksHTTPFetchTimeout = 10 * time.Second
+
+// JWK Set loading sentinels. Wrapped with %w so callers/tests can match via
+// errors.Is and so err113 is satisfied without inline suppression.
+var (
+	errJWKSetFileHost       = errors.New(`file:// JWK Set URL host must be empty (file:///path) or "localhost"; literal IPs like "127.0.0.1"/"[::1]" are not accepted, omit the host entirely`)
+	errJWKSetFileNotRegular = errors.New("JWK Set path is not a regular file")
+	errJWKSetFileTooLarge   = errors.New("JWK Set file exceeds size cap")
+)
+
 // newJWKSetKeyfunc builds a Keyfunc from a JWK Set URL.
 //
 // file:// URLs point to a local JSON file containing a JWK Set; the file is
 // read once at provision time, so rotating the keys requires a Caddy config
-// reload. Other URLs are forwarded to keyfunc.NewDefaultCtx, which handles
-// HTTP(S) and rejects unsupported schemes.
+// reload. HTTP(S) URLs are fetched once at provision via keyfunc, then
+// refreshed by its background goroutine.
+//
+// fail-fast: keyfunc's NewDefaultCtx defaults NoErrorReturnFirstHTTPReq=true,
+// meaning a first-fetch failure (typo'd URL, unreachable host, wrong scheme)
+// returns a usable-but-EMPTY key set and the hub boots — then rejects every
+// JWT because no keys loaded. That "starts green, auth dead" mode is a nasty
+// operator footgun. NewDefaultOverrideCtx with NoErrorReturnFirstHTTPReq=false
+// surfaces the fetch error at Provision time so a broken JWKS URL fails the
+// Caddy config load loudly instead.
 //
 //nolint:ireturn
 func newJWKSetKeyfunc(ctx context.Context, rawURL string) (keyfunc.Keyfunc, error) {
@@ -610,24 +746,102 @@ func newJWKSetKeyfunc(ctx context.Context, rawURL string) (keyfunc.Keyfunc, erro
 	}
 
 	if u.Scheme == "file" {
-		if u.Host != "" && u.Host != "localhost" {
-			return nil, fmt.Errorf(`file:// JWK Set URL host must be empty or "localhost", got %q`, u.Host) //nolint:err113
-		}
-
-		b, err := os.ReadFile(u.Path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read JWK Set file %q: %w", u.Path, err)
-		}
-
-		k, err := keyfunc.NewJWKSetJSON(b)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse JWK Set file %q: %w", u.Path, err)
-		}
-
-		return k, nil
+		return loadFileJWKSet(u)
 	}
 
-	return keyfunc.NewDefaultCtx(ctx, []string{rawURL}) //nolint:wrapcheck
+	failFast := false
+
+	// Pass the long-lived ctx (keyfunc binds the background refresh goroutine
+	// to it); HTTPTimeout — not a short ctx — bounds the synchronous first
+	// fetch so a slow/blackholing JWKS endpoint can't hang Provision. A short
+	// ctx here would also kill the refresh goroutine after the timeout.
+	k, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{rawURL}, keyfunc.Override{
+		NoErrorReturnFirstHTTPReq: &failFast,
+		HTTPTimeout:               jwksHTTPFetchTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to load JWK Set from %q: %w", rawURL, err)
+	}
+
+	return k, nil
+}
+
+// loadFileJWKSet reads a file:// JWK Set URL into a keyfunc.Keyfunc. The host
+// must be empty or "localhost"; the path is filepath.Clean'd before open to
+// normalise away "..". Only regular files are accepted — character / block
+// devices, FIFOs, and sockets are rejected via the post-open Fstat check.
+//
+// The open is O_NONBLOCK: a blocking open(2) on a FIFO with no writer hangs
+// forever (POSIX: the read end blocks until a writer appears), which would
+// wedge Caddy's config load with no timeout to bound it. O_NONBLOCK makes the
+// FIFO open return immediately so the Fstat IsRegular check below can reject
+// it. On a regular file O_NONBLOCK is a no-op (regular-file reads never return
+// EAGAIN), so the subsequent io.ReadAll behaves normally.
+//
+// Open-then-Fstat (rather than Stat-then-Open) is also TOCTOU-safe: the
+// IsRegular check runs against the fd this function actually opened, not a
+// path that could be swapped between a Stat and a later Open.
+//
+// Body size is then bounded with io.LimitReader + a post-read len check, so
+// a regular file that grows between Fstat and Read cannot exceed the cap.
+//
+//nolint:ireturn // keyfunc.Keyfunc is the interface contract.
+func loadFileJWKSet(u *url.URL) (keyfunc.Keyfunc, error) {
+	// Host is restricted to empty or "localhost" (case-insensitive). Literal
+	// loopback IPs (`127.0.0.1`, `[::1]`) are NOT accepted: file:// URLs
+	// resolve the path component on the local filesystem regardless of
+	// host, and accepting literal IPs invites confusion with HTTP URL
+	// semantics. The error message enumerates rejected-but-loopback-equivalent
+	// forms so operators don't waste time on the canonical form.
+	switch strings.ToLower(u.Host) {
+	case "", "localhost":
+		// accepted
+	default:
+		return nil, fmt.Errorf("%w: got %q", errJWKSetFileHost, u.Host)
+	}
+
+	path := filepath.Clean(u.Path)
+
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		// "failed to read JWK Set file" wording preserves the operator
+		// log-grep contract from the pre-hardening shape. The "(open)"
+		// qualifier disambiguates which step failed for log triage without
+		// breaking existing alerts that grep on the leading phrase.
+		return nil, fmt.Errorf("failed to read JWK Set file %q (open): %w", path, err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read JWK Set file %q (fstat): %w", path, err)
+	}
+
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %q (mode %s)", errJWKSetFileNotRegular, path, fi.Mode())
+	}
+
+	if fi.Size() > maxJWKSetFileBytes {
+		return nil, fmt.Errorf("%w: %q is %d bytes, exceeds %d", errJWKSetFileTooLarge, path, fi.Size(), maxJWKSetFileBytes)
+	}
+
+	// LimitReader at cap+1 so reads of exactly cap bytes succeed and a file
+	// that grows past cap between Fstat and Read trips the post-check below.
+	b, err := io.ReadAll(io.LimitReader(f, maxJWKSetFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read JWK Set file %q: %w", path, err)
+	}
+
+	if len(b) > maxJWKSetFileBytes {
+		return nil, fmt.Errorf("%w: %q grew past %d during read", errJWKSetFileTooLarge, path, maxJWKSetFileBytes)
+	}
+
+	k, err := keyfunc.NewJWKSetJSON(b)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse JWK Set file %q: %w", path, err)
+	}
+
+	return k, nil
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Middleware.
@@ -637,14 +851,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return m, m.UnmarshalCaddyfile(h.Dispenser)
 }
 
+// parseDurationParameter returns errors via Dispenser.ArgErr / Dispenser.WrapErr —
+// those ARE the framework's wrappers, so re-wrapping with %w would double-wrap.
+//
+//nolint:wrapcheck // see comment above.
 func parseDurationParameter(d *caddyfile.Dispenser) (*caddy.Duration, error) {
 	if !d.NextArg() {
-		return nil, d.ArgErr() //nolint:wrapcheck
+		return nil, d.ArgErr()
 	}
 
 	du, err := caddy.ParseDuration(d.Val())
 	if err != nil {
-		return nil, d.WrapErr(err) //nolint:wrapcheck
+		return nil, d.WrapErr(err)
 	}
 
 	cd := caddy.Duration(du)

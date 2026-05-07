@@ -20,17 +20,51 @@ type LocalSubscriber struct {
 	responseLastEventID chan string
 	ready               atomic.Uint32
 	liveQueue           []*Update
+	// outBufferLength caps both the out channel and the pre-ready liveQueue. A
+	// large fleet wants this small: ~8 KB × this × connections of buffer is
+	// committed on connect, an OOM vector during a cold-start herd.
+	outBufferLength int
 }
 
-const outBufferLength = 1000
+const defaultOutBufferLength = 1000
+
+// MinSubscriberOutBuffer floors the configurable out buffer: below this the
+// stream drops live updates too eagerly. WithSubscriberOutBuffer and the
+// Caddyfile parser reject a positive value under this floor; the withOutBuffer
+// guard below is then a defense-in-depth invariant that also maps the
+// zero-value (an unconfigured hub) to the default.
+const MinSubscriberOutBuffer = 16
+
+// localSubscriberOption configures a LocalSubscriber at construction. Unexported
+// so the out-buffer size stays a hub-internal knob (set via the Hub's
+// WithSubscriberOutBuffer); external NewLocalSubscriber callers keep the default.
+type localSubscriberOption func(*localSubscriberConfig)
+
+type localSubscriberConfig struct {
+	outBufferLength int
+}
+
+func withOutBuffer(n int) localSubscriberOption {
+	return func(c *localSubscriberConfig) {
+		if n >= MinSubscriberOutBuffer {
+			c.outBufferLength = n
+		}
+	}
+}
 
 // NewLocalSubscriber creates a new subscriber.
-func NewLocalSubscriber(lastEventID string, logger *slog.Logger, topicSelectorStore *TopicSelectorStore) *LocalSubscriber {
+func NewLocalSubscriber(lastEventID string, logger *slog.Logger, topicSelectorStore *TopicSelectorStore, opts ...localSubscriberOption) *LocalSubscriber {
+	cfg := localSubscriberConfig{outBufferLength: defaultOutBufferLength}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	id := "urn:uuid:" + uuid.Must(uuid.NewV4()).String()
 	s := &LocalSubscriber{
 		Subscriber:          *NewSubscriber(logger, topicSelectorStore),
 		responseLastEventID: make(chan string, 1),
-		out:                 make(chan *Update, outBufferLength),
+		out:                 make(chan *Update, cfg.outBufferLength),
+		outBufferLength:     cfg.outBufferLength,
 	}
 
 	s.ID = id
@@ -52,6 +86,17 @@ func (s *LocalSubscriber) Dispatch(ctx context.Context, u *Update, fromHistory b
 	}
 
 	if !fromHistory && s.ready.Load() < 1 {
+		// Bound the pre-ready queue. If live traffic outruns history replay by
+		// more than the out buffer could ever drain on Ready(), shed now (the
+		// client reconnects and replays from a later point) rather than letting
+		// liveQueue grow unbounded — under a reconnect storm that retains
+		// replaying_subs × publish_rate × replay_latency pointers and OOMs.
+		if len(s.liveQueue) >= s.outBufferLength {
+			s.handleFullChan(ctx)
+
+			return false
+		}
+
 		s.liveQueue = append(s.liveQueue, u)
 
 		return true
@@ -117,8 +162,16 @@ func (s *LocalSubscriber) Disconnect() {
 func (s *LocalSubscriber) handleFullChan(ctx context.Context) {
 	s.doDisconnect()
 
-	if s.logger.Enabled(ctx, slog.LevelInfo) {
-		s.logger.LogAttrs(ctx, slog.LevelInfo, "Subscriber unable to receive updates fast enough")
+	// Attribute the drop to a specific client. The transport's
+	// subscribers_lost{reason="backpressure"} metric tells operators it
+	// happened; this log lets them identify which subscriber/topics so
+	// the offending client can be investigated.
+	if s.logger.Enabled(ctx, slog.LevelWarn) {
+		s.logger.LogAttrs(
+			ctx, slog.LevelWarn,
+			"Subscriber disconnected: unable to receive updates fast enough",
+			slog.Any("subscriber", &s.Subscriber),
+		)
 	}
 }
 

@@ -1,50 +1,134 @@
-# Learn how to configure the Mercure.rocks Hub on https://mercure.rocks/docs/hub/config
+# Mercure Hub - Production Configuration (Direct Deployment)
+# Caddy manages TLS directly
+# TLS is only enabled on the main server — :9091 (metrics) is plain HTTP, admin is off
+# https://mercure.rocks/docs/hub/config
+# https://caddyserver.com/docs/caddyfile
 {
+	# Bind admin to loopback only. The Dockerfile HEALTHCHECK probes
+	# /mercure/health/ready on this listener for transport-aware health.
+	# Caddy's default origin check rejects non-loopback origins with 403,
+	# so this is functionally equivalent to admin off for external callers
+	# while keeping in-container health endpoints reachable.
+	admin localhost:2019
+
+	# Clean shutdown: exit after 10s, don't wait for SSE connections
+	grace_period 10s
+
 	{$GLOBAL_OPTIONS}
+}
+
+# Metrics endpoint (Prometheus-compatible, internal only)
+:9091 {
+	handle /metrics {
+		metrics
+	}
+	handle {
+		respond 404
+	}
 }
 
 {$CADDY_EXTRA_CONFIG}
 
 {$SERVER_NAME:localhost} {
+	# HSTS: tell browsers to always use HTTPS
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
 	log {
 		format filter {
 			fields {
 				request>uri query {
 					replace authorization REDACTED
+					replace jwt REDACTED
 				}
 			}
 		}
 	}
 
-	encode zstd gzip
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API)
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
 
-	mercure {
-		# Publisher JWT key
-		publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
-		# Subscriber JWT key
-		subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
-		# Extra directives
-		{$MERCURE_EXTRA_DIRECTIVES}
+	# `handle` blocks enforce mutually-exclusive matching: the most
+	# specific path wins. This is more predictable than relying on
+	# Caddy's directive_order (which has historically reordered
+	# reverse_proxy AFTER catchall respond, breaking the health route).
+	# Order of handle blocks in the file doesn't affect routing —
+	# Caddy picks the most specific matcher.
+
+	# Transport-aware health check, reverse-proxied to the admin API
+	# (loopback-only inside the container). Path-scoped so only
+	# /mercure/health/{ready,live} reaches admin — no other admin
+	# endpoint is externally exposed. External probes (k8s liveness,
+	# monitoring) use this; container HEALTHCHECK hits admin via
+	# 127.0.0.1:2019 directly.
+	#
+	# `header_up Host {upstream_hostport}` rewrites Host to
+	# `127.0.0.1:2019` so it matches admin's origin allowlist. Without
+	# this, admin returns 403 with `{"error":"host not allowed: ..."}`
+	# because the inbound Host (`localhost` or whatever SERVER_NAME
+	# resolves to) isn't in admin's loopback-variant allowlist.
+	handle /mercure/health/* {
+		reverse_proxy 127.0.0.1:2019 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	# Defense-in-depth: refuse the embedded debug UI subtree at the
+	# edge regardless of mercure module config. Even if MERCURE_EXTRA_
+	# DIRECTIVES accidentally enables `ui` or `demo`, the 403 here keeps
+	# /ui/fixtures (demo private JWK + HS256 secret) unreachable.
+	handle /.well-known/mercure/ui/* {
+		respond "Forbidden" 403
+	}
+
+	# The hub itself — publish/subscribe on /.well-known/mercure plus
+	# any subscription endpoints registered by the mercure module.
+	#
+	# `route` keeps `tracing` ahead of `mercure` in written order (and tolerates
+	# whatever MERCURE_TRACING_DIRECTIVE expands to). Scoped to the hub path so
+	# only publish/subscribe is traced — not health probes, robots, or 404s.
+	# Empty by default (no middleware added); set MERCURE_TRACING_DIRECTIVE=tracing
+	# to emit spans.
+	handle /.well-known/mercure* {
+		route {
+			{$MERCURE_TRACING_DIRECTIVE:}
+			mercure {
+				# Human-readable hub identifier used in per-hub health endpoints and metrics labels.
+				# /mercure/health/{$MERCURE_HUB_NAME}/{ready,live} — defaults to "default" if unset.
+				name {$MERCURE_HUB_NAME:default}
+				# JWT authentication (REQUIRED - no defaults, Caddy fails if not set).
+				# {env.VAR} is the runtime placeholder resolved at module Provision
+				# time (see populateJWTConfig in caddy/mercure.go) — survives
+				# multi-line PEM keys that {$VAR} (parse-time substitution) would
+				# mangle by splitting them across Caddyfile directives.
+				publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+				subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+				# Extra directives (transport, cors_origins, subscriptions, etc.)
+				{$MERCURE_EXTRA_DIRECTIVES}
+			}
+		}
+	}
+
+	handle /robots.txt {
+		respond `User-agent: *
+        Disallow: /`
+	}
+
+	handle / {
+		respond "Forbidden" 403
+	}
+
+	handle {
+		respond "Not Found" 404
 	}
 
 	{$CADDY_SERVER_EXTRA_DIRECTIVES}
 
+	# Skip logging for health/utility endpoints
 	log_skip /robots.txt
-	log_skip /healthz
 	log_skip /favicon.ico
-
-	header / Content-Type "text/html; charset=utf-8"
-	respond / `<!DOCTYPE html>
-	<html lang=en>
-	<meta charset="utf-8">
-	<meta name="robots" content="noindex">
-	<title>Welcome to Mercure</title>
-	<h1>Welcome to Mercure</h1>
-	<p>The URL of your hub is <code>/.well-known/mercure</code>.
-	Read the documentation on <a href="https://mercure.rocks">Mercure.rocks, real-time apps made easy</a>.`
-	respond /robots.txt `User-agent: *
-	Disallow: /`
-	# Deprecated: use the /mercure/health/ready and /mercure/health/live admin API endpoints for transport-aware health checks
-	respond /healthz 200
-	respond "Not Found" 404
+	# Uncomment if /mercure/health/* probe noise becomes a problem:
+	# log_skip /mercure/health/*
 }

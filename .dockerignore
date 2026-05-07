@@ -1,0 +1,29 @@
+# The build compiles the whole module from the context (Dockerfile `COPY ./ ./`),
+# so exclude only build artifacts + what the compile never reads. `-buildvcs=false`
+# makes `.git/` unused; `.env*` is excluded so secrets never reach the daemon/layers.
+.git/
+.env
+.env.*
+# Build / test / tooling artifacts + local runtime state — context bloat only.
+bin/
+data/
+*.db
+coverage.out
+coverage.html
+.task/
+.rumdl_cache/
+conformance-tests/
+# Local-only files (git-excluded; never part of the image).
+AGENTS.md
+.claude/
+# Editor / OS junk.
+.idea/
+.vscode/
+.zed/
+*.iml
+*.swp
+.DS_Store
+# Non-compiled trees the hub binary build never reads.
+.github/
+gatling/
+charts/

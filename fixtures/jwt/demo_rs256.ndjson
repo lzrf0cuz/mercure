@@ -1,0 +1,28 @@
+{
+  "typ": "at+jwt",
+  "alg": "RS256",
+  "kid": "d7538996-f6d0-4ba4-831d-be962ea9a7e5"
+}
+{
+  "iss": "https://localhost",
+  "aud": "mock_mercure_service",
+  "sub": "ca4a7389-4106-491f-b8df-f9d80ba3b0ac",
+  "client_id": "mock_client_app",
+  "exp": 4906803676,
+  "iat": 1749066076,
+  "jti": "fde818a2-c143-4859-bff0-f0487944a8aa",
+  "mercure": {
+    "publish": [
+      "*"
+    ],
+    "subscribe": [
+      "https://example.com/my-private-topic",
+      "{scheme}://{+host}/demo/books/{id}.jsonld",
+      "/.well-known/mercure/subscriptions{/topic}{/subscriber}"
+    ],
+    "payload": {
+      "user_name": "mock_user",
+      "user_id": "ca4a7389-4106-491f-b8df-f9d80ba3b0ac"
+    }
+  }
+}

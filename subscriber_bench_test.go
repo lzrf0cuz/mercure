@@ -41,7 +41,8 @@ func subscribeBenchmarkHelper(b *testing.B, subBench func(b *testing.B, topics, 
 	for _, topics := range topicOpts {
 		for _, concurrency := range concurrencyOpts {
 			for _, matchPct := range matchPctOpts {
-				subBench(b,
+				subBench(
+					b,
 					topics,
 					concurrency,
 					matchPct,

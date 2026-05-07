@@ -322,6 +322,60 @@ func TestBoltGetSubscribers(t *testing.T) {
 	assert.Contains(t, subscribers, &s2.Subscriber)
 }
 
+// TestBoltAddSubscriberRollbackOnHistoryError locks in the fix at
+// bolt.go:148 — when dispatchHistory errors mid-walk (e.g. corrupt JSON in
+// the bucket), AddSubscriber must roll the subscriber back out of
+// t.subscribers before returning the error. Pre-fix, the subscriber leaked
+// permanently because the HTTP handler's defer RemoveSubscriber never runs
+// when AddSubscriber returns an error.
+func TestBoltAddSubscriberRollbackOnHistoryError(t *testing.T) {
+	t.Parallel()
+
+	transport := createBoltTransport(t, 0, 0)
+	ctx := t.Context()
+
+	// Dispatch a valid Update first so t.lastSeq advances to 1 (otherwise
+	// pastSeqBound short-circuits dispatchHistory before unmarshal).
+	require.NoError(t, transport.Dispatch(ctx, &Update{
+		Topics: []string{"t"},
+		Event:  Event{ID: "good"},
+	}))
+
+	// Inject a corrupt JSON entry directly into the bucket at the next
+	// sequence number — emulating disk corruption mid-stream. Bypass
+	// transport.persist so we can plant invalid JSON.
+	require.NoError(t, transport.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(defaultBoltBucketName))
+		require.NotNil(t, bucket)
+
+		seq, err := bucket.NextSequence()
+		require.NoError(t, err)
+
+		prefix := make([]byte, 8)
+		binary.BigEndian.PutUint64(prefix, seq)
+		key := bytes.Join([][]byte{prefix, []byte("corrupt")}, []byte{})
+
+		return bucket.Put(key, []byte("not-valid-json"))
+	}))
+
+	// Align lastSeq with the injected entry so dispatchHistory walks past the
+	// matched ID into the corrupt entry instead of bailing on pastSeqBound.
+	transport.Lock()
+	transport.lastSeq = 2
+	transport.Unlock()
+
+	s := NewLocalSubscriber("good", transport.logger, &TopicSelectorStore{})
+	s.SetTopics([]string{"t"}, nil)
+
+	err := transport.AddSubscriber(ctx, s)
+	require.Error(t, err, "AddSubscriber must surface dispatchHistory's unmarshal error")
+
+	// The actual regression assertion: subscriber must NOT remain in
+	// t.subscribers after the error. Pre-fix this would be 1 (leaked).
+	assert.Zero(t, transport.subscribers.Len(),
+		"failed AddSubscriber must roll the subscriber back out of t.subscribers")
+}
+
 func TestBoltLastEventID(t *testing.T) {
 	t.Parallel()
 

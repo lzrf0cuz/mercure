@@ -1,0 +1,70 @@
+# Security: Secrets & Credentials
+# CRITICAL: Never commit secrets to version control
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# API keys and tokens
+*.secret
+*-secret.*
+*.credentials
+credentials.json
+service-account*.json
+
+# Cloud provider configs with secrets
+.aws/credentials
+.gcloud/
+.azure/
+
+# Test coverage
+coverage.out
+coverage.html
+
+# pprof + bench artifacts
+/profiles/
+*.pprof
+
+# Build artifacts
+*.test
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+compose.override.yaml
+compose.override.yml
+
+# Data
+/data/
+
+# Locally-generated test fixtures (cluster TLS certs)
+/.tmp/

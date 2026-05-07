@@ -45,7 +45,7 @@ func TestSecurityOptions(t *testing.T) {
 	// loop until the web server is ready
 	var resp *http.Response
 	for resp == nil {
-		resp, _ = client.Get(testSecureURL) //nolint:bodyclose
+		resp, _ = client.Get(testSecureURL)
 	}
 
 	assert.Equal(t, "default-src 'self' mercure.rocks cdn.jsdelivr.net", resp.Header.Get("Content-Security-Policy"))
@@ -74,7 +74,7 @@ func TestSecurityOptions(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
 	require.NoError(t, resp3.Body.Close())
 
-	require.NoError(t, h.server.Shutdown(t.Context()))
+	require.NoError(t, h.server.Load().Shutdown(t.Context()))
 }
 
 func TestSecurityOptionsWithCorsOrigin(t *testing.T) {
@@ -94,7 +94,7 @@ func TestSecurityOptionsWithCorsOrigin(t *testing.T) {
 	// loop until the web server is ready
 	var resp *http.Response
 	for resp == nil {
-		resp, _ = client.Get(testSecureURL) //nolint:bodyclose
+		resp, _ = client.Get(testSecureURL)
 	}
 
 	assert.Equal(t, "default-src 'self'", resp.Header.Get("Content-Security-Policy"))
@@ -121,7 +121,7 @@ func TestSecurityOptionsWithCorsOrigin(t *testing.T) {
 	assert.Equal(t, "https://subscriber.com", resp2.Header.Get("Access-Control-Allow-Origin"))
 	require.NoError(t, resp2.Body.Close())
 
-	require.NoError(t, h.server.Shutdown(t.Context()))
+	require.NoError(t, h.server.Load().Shutdown(t.Context()))
 }
 
 func TestServe(t *testing.T) {
@@ -193,7 +193,7 @@ data: hello
 	require.NoError(t, err)
 	require.NoError(t, resp2.Body.Close())
 
-	require.NoError(t, h.server.Shutdown(t.Context()))
+	require.NoError(t, h.server.Load().Shutdown(t.Context()))
 	wgTested.Wait()
 }
 
@@ -306,7 +306,7 @@ func TestClientClosesThenReconnects(t *testing.T) {
 	}
 
 	wg.Wait()
-	require.NoError(t, h.server.Shutdown(t.Context()))
+	require.NoError(t, h.server.Load().Shutdown(t.Context()))
 }
 
 func TestServeAcme(t *testing.T) {
@@ -325,7 +325,7 @@ func TestServeAcme(t *testing.T) {
 
 	var resp *http.Response
 	for resp == nil {
-		resp, _ = client.Get("http://127.0.0.1:8080") //nolint:bodyclose
+		resp, _ = client.Get("http://127.0.0.1:8080")
 	}
 
 	require.NotNil(t, resp)
@@ -338,7 +338,7 @@ func TestServeAcme(t *testing.T) {
 	assert.Equal(t, 403, resp.StatusCode)
 	require.NoError(t, resp.Body.Close())
 
-	require.NoError(t, h.server.Shutdown(t.Context()))
+	require.NoError(t, h.server.Load().Shutdown(t.Context()))
 }
 
 func TestMetricsAccess(t *testing.T) {
@@ -363,7 +363,7 @@ func TestMetricsCollect(t *testing.T) {
 	server.newSubscriber("https://example.com/alt/1", true)
 	server.newSubscriber("https://example.com/alt/1", true)
 	server.newSubscriber("https://example.com/alt/1", false)
-	server.waitSubscribers()
+	server.waitForSubscriber()
 
 	body := url.Values{"topic": {"https://example.com/foo/1", "https://example.com/alt/1"}, "data": {"hello"}, "id": {"first"}}
 	server.publish(body)
@@ -437,8 +437,8 @@ func (s *testServer) shutdown() {
 	s.t.Helper()
 
 	s.t.Cleanup(func() {
-		_ = s.h.server.Shutdown(s.t.Context())
-		require.NoError(s.t, s.h.metricsServer.Shutdown(s.t.Context()))
+		_ = s.h.server.Load().Shutdown(s.t.Context())
+		require.NoError(s.t, s.h.metricsServer.Load().Shutdown(s.t.Context()))
 		s.wgShutdown.Done()
 		s.wgTested.Wait()
 	})
@@ -476,7 +476,7 @@ func (s *testServer) publish(body url.Values) {
 	require.NoError(s.t, resp.Body.Close())
 }
 
-func (s *testServer) waitSubscribers() {
+func (s *testServer) waitForSubscriber() {
 	s.t.Helper()
 
 	s.wgConnected.Wait()

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -40,8 +41,16 @@ func (rc *responseController) setDispatchWriteDeadline(ctx context.Context) bool
 		return true
 	}
 
-	if err := rc.SetWriteDeadline(deadline); err != nil && rc.hub.logger.Enabled(ctx, slog.LevelInfo) {
-		rc.hub.logger.LogAttrs(ctx, slog.LevelInfo, "Unable to set dispatch write deadline", slog.Any("error", err))
+	if err := rc.SetWriteDeadline(deadline); err != nil {
+		// Same level-gate / err-check conflation hazard as h.write below:
+		// folding the level check into the if expression silently swallows
+		// the deadline-set error at WARN+, leaving the caller to write
+		// against a connection whose deadline could not be set. The
+		// return-false must always fire on a real error; only the log
+		// line is conditional on level.
+		if rc.hub.logger.Enabled(ctx, slog.LevelInfo) {
+			rc.hub.logger.LogAttrs(ctx, slog.LevelInfo, "Unable to set dispatch write deadline", slog.Any("error", err))
+		}
 
 		return false
 	}
@@ -101,6 +110,21 @@ func (h *Hub) getWriteDeadline(s *LocalSubscriber) (deadline time.Time) {
 func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Front-door admission gate (before authorize + allocation). On reject it
+	// has already written the response. `defer release()` is declared HERE,
+	// before `defer h.shutdown` below, so LIFO frees the admission slot LAST —
+	// after the subscriber's transport teardown — closing an over-admit window.
+	admitCtx, release, ok := h.admitSubscriber(ctx, w, r)
+	if !ok {
+		return
+	}
+
+	if release != nil {
+		defer release()
+	}
+
+	ctx = admitCtx
+
 	s, rc := h.registerSubscriber(ctx, w, r)
 	if s == nil {
 		return
@@ -108,8 +132,21 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx = context.WithValue(ctx, SubscriberContextKey, &s.Subscriber)
 
-	defer h.shutdown(ctx, s)
+	// Track why the SubscribeHandler loop exits so h.shutdown can label
+	// the per-reason disconnect counter. Closure captures by reference,
+	// so the value set in the loop below is visible at defer time.
+	disconnectReason := DisconnectReasonUnknown
 
+	defer func() {
+		h.shutdown(ctx, s, disconnectReason)
+	}()
+
+	// setDefaultWriteDeadline is intentionally best-effort: ResponseWriter
+	// wrappers that return http.ErrNotSupported (some HTTP/2 push proxies,
+	// custom adapters) cannot set deadlines, but the SSE stream itself is
+	// still functional. handleWriterError logs the failure inside; we
+	// proceed and let the actual write+select loop classify any later
+	// disconnect on its own merits.
 	rc.setDefaultWriteDeadline(ctx)
 
 	var (
@@ -158,25 +195,43 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Hub is shutting down, closing connection")
 			}
 
+			disconnectReason = DisconnectReasonHubShutdown
+
 			return
 		case <-ctx.Done():
 			if debugLevel {
 				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Connection closed by the client")
 			}
 
+			disconnectReason = DisconnectReasonClientClosed
+
 			return
 		case <-heartbeatTimerC:
-			// Send an SSE comment as a heartbeat, to prevent issues with some proxies and old browsers
-			if !h.write(ctx, rc, ":\n") {
+			// Send an SSE comment as a heartbeat, to prevent issues with some proxies
+			// and old browsers. Inline []byte for the 2-byte literal; only the
+			// KB-scale per-update bytes are worth caching (see newSerializedUpdate).
+			if !h.write(ctx, rc, []byte(":\n")) {
+				disconnectReason = DisconnectReasonWriteFailed
+
 				return
 			}
 
 			heartbeatTimer.Reset(h.heartbeat)
 		case <-disconnectionTimerC:
 			// Cleanly close the HTTP connection before the write deadline to prevent client-side errors
+			disconnectReason = DisconnectReasonWriteTimeout
+
 			return
 		case update, ok := <-s.Receive():
-			if !ok || !h.write(ctx, rc, newSerializedUpdate(update).event) {
+			if !ok {
+				disconnectReason = DisconnectReasonTransportEnded
+
+				return
+			}
+
+			if !h.write(ctx, rc, newSerializedUpdate(update).eventBytes) {
+				disconnectReason = DisconnectReasonWriteFailed
+
 				return
 			}
 
@@ -189,18 +244,81 @@ func (h *Hub) SubscribeHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if debugLevel {
-				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Update sent", slog.Any("update", update))
+				// Bounded fields rather than slog.Any("update", update): see
+				// Hub.Publish for the publisher-controlled Type rationale.
+				// Topics intentionally dropped here — they're identical for
+				// every subscriber receiving this update, multiplying the
+				// log line cost by subscriber-count without forensic value.
+				rc.hub.logger.LogAttrs(ctx, slog.LevelDebug, "Update sent",
+					slog.String("update_id", update.ID),
+					slog.Bool("private", update.Private),
+					slog.Int("data_bytes", len(update.Data)))
 			}
 		}
 	}
 }
 
 // registerSubscriber initializes the connection.
+// admitSubscriber runs the front-door admission gate: a cheap abuse cap (the
+// query-topic count, so a topic-flood can't burn the admission budget) followed
+// by the transport's OPTIONAL Admitter. It returns the (possibly
+// admission-marked) context, a release closure to defer (nil when the transport
+// has no admission control), and ok=false — having already written the response
+// — when rejected (400 for a topic flood, 429 for a shed admission, 503 for an
+// unavailable transport).
+//
+// Only the *abuse* cap (too many topics) runs here. The "missing topic" 400 and
+// the JWT auth stay in registerSubscriber, AFTER this gate, so an unauthenticated
+// request keeps its auth-first response ordering — admission sheds on capacity,
+// not on request validity.
+func (h *Hub) admitSubscriber(ctx context.Context, w http.ResponseWriter, r *http.Request) (context.Context, func(), bool) {
+	if len(r.URL.Query()["topic"]) > maxQueryTopics {
+		http.Error(w, `Too many "topic" parameters.`, http.StatusBadRequest)
+
+		return ctx, nil, false
+	}
+
+	admitter, ok := h.transport.(Admitter)
+	if !ok {
+		return ctx, nil, true // transport has no admission control — admit
+	}
+
+	admitCtx, release, err := admitter.TryAdmit(ctx)
+	if err != nil {
+		h.writeAdmissionError(ctx, w, err)
+
+		return ctx, nil, false
+	}
+
+	return admitCtx, release, true
+}
+
+// writeAdmissionError maps a TryAdmit error to the HTTP response: an
+// *AdmissionError → 429 with an integer Retry-After (RFC 9110 delay-seconds,
+// rounded up); any other error (e.g. a closed transport) → 503.
+func (h *Hub) writeAdmissionError(ctx context.Context, w http.ResponseWriter, err error) {
+	var ae *AdmissionError
+	if errors.As(err, &ae) {
+		// Integer ceil without importing math: (d + 1s - 1ns) / 1s.
+		if secs := int((ae.RetryAfter + time.Second - time.Nanosecond) / time.Second); secs > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+		}
+
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+	} else {
+		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+	}
+
+	if h.logger.Enabled(ctx, slog.LevelDebug) {
+		h.logger.LogAttrs(ctx, slog.LevelDebug, "Subscriber admission rejected", slog.Any("error", err))
+	}
+}
+
 func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *http.Request) (*LocalSubscriber, *responseController) { //nolint:funlen
 	ctx, span := startSpan(ctx, "mercure.subscribe", trace.WithSpanKind(trace.SpanKindConsumer))
 	defer span.End()
 
-	s := NewLocalSubscriber(h.retrieveLastEventID(ctx, r), h.logger, h.topicSelectorStore)
+	s := NewLocalSubscriber(h.retrieveLastEventID(ctx, r), h.logger, h.topicSelectorStore, withOutBuffer(h.subscriberOutBuffer))
 
 	var (
 		privateTopics []string
@@ -210,7 +328,7 @@ func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *
 	if h.subscriberJWTKeyFunc != nil { //nolint:nestif
 		var err error
 
-		claims, err = h.authorize(r, false)
+		claims, err = h.authorizeAndBind(r, false)
 		if claims != nil {
 			s.Claims = claims
 			privateTopics = claims.Mercure.Subscribe
@@ -253,6 +371,14 @@ func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *
 		)
 	}
 
+	// Re-check cancellation right before the un-cancellable registration: a
+	// client that disconnected during admission/auth should abandon here rather
+	// than commit a WithoutCancel registration whose teardown then frees the
+	// admission slot anyway (the handler's deferred release).
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+
 	addCtx := context.WithoutCancel(ctx)
 	h.dispatchSubscriptionUpdate(addCtx, s, true)
 
@@ -275,9 +401,16 @@ func (h *Hub) registerSubscriber(ctx context.Context, w http.ResponseWriter, r *
 
 	if h.logger.Enabled(ctx, slog.LevelInfo) {
 		if claims != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
-			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber", slog.Any("payload", claims.Mercure.Payload))
+			h.logger.LogAttrs(
+				ctx, slog.LevelInfo, "New subscriber",
+				slog.Any("subscriber", &s.Subscriber),
+				slog.Any("payload", claims.Mercure.Payload),
+			)
 		} else {
-			h.logger.LogAttrs(ctx, slog.LevelInfo, "New subscriber")
+			h.logger.LogAttrs(
+				ctx, slog.LevelInfo, "New subscriber",
+				slog.Any("subscriber", &s.Subscriber),
+			)
 		}
 	}
 
@@ -354,36 +487,86 @@ func (h *Hub) retrieveLastEventID(ctx context.Context, r *http.Request) string {
 	return ""
 }
 
-// Write sends the given string to the client.
+// Write sends the given bytes to the client.
 // It returns false if the subscriber has been disconnected (e.g. timeout).
-func (h *Hub) write(ctx context.Context, rc *responseController, data string) bool {
+// For the per-update path, data is the cached wire bytes shared read-only across
+// the concurrent fan-out, so callers must not mutate it.
+func (h *Hub) write(ctx context.Context, rc *responseController, data []byte) bool {
+	// Observer captured before the timed body so the observation always
+	// fires (defer) regardless of which return path exits. Type assertion
+	// is per-call because h.metrics is the Metrics interface (no narrower
+	// extension type) — branch-predicted, identical to the
+	// DisconnectReasonReporter type assertion in shutdown(). Steady state
+	// is NopMetrics or PrometheusMetrics; the cost is negligible.
+	observer, _ := h.metrics.(WriteFlushObserver)
+
+	ok := false
+
+	if observer != nil {
+		start := time.Now()
+		defer func() {
+			observer.ObserveWriteFlush(time.Since(start).Seconds(), ok)
+		}()
+	}
+
 	if !rc.setDispatchWriteDeadline(ctx) {
 		return false
 	}
 
-	if _, err := rc.rw.Write([]byte(data)); err != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
-		h.logger.LogAttrs(ctx, slog.LevelDebug, "Failed to write comment", slog.Any("error", err))
+	// Use rc.rw.Write, NOT io.WriteString: io.WriteString would dispatch to the
+	// writer's promoted WriteString, changing which method the write path (and
+	// tests that observe Write) see.
+	if _, err := rc.rw.Write(data); err != nil {
+		// The level-gate only conditions the log line; the return-false must
+		// always fire on a write error. Folding the level check into the if
+		// expression (the upstream shape) silently swallows write errors when
+		// the operator runs at INFO+, misclassifying write_failed as
+		// client_closed (when the request ctx eventually cancels) or unknown.
+		if h.logger.Enabled(ctx, slog.LevelDebug) {
+			h.logger.LogAttrs(ctx, slog.LevelDebug, "Failed to write comment", slog.Any("error", err))
+		}
 
 		return false
 	}
 
-	return rc.flush(ctx) && rc.setDefaultWriteDeadline(ctx)
+	ok = rc.flush(ctx) && rc.setDefaultWriteDeadline(ctx)
+
+	return ok
 }
 
-func (h *Hub) shutdown(ctx context.Context, s *LocalSubscriber) {
+func (h *Hub) shutdown(ctx context.Context, s *LocalSubscriber, reason DisconnectReason) {
 	// Notify that the client is closing the connection
 	s.Disconnect()
 
 	ctx = context.WithoutCancel(ctx)
 
-	if err := h.transport.RemoveSubscriber(ctx, s); err != nil && h.logger.Enabled(ctx, slog.LevelError) {
-		h.logger.LogAttrs(ctx, slog.LevelError, "Failed to remove subscriber on shutdown", slog.Any("error", err))
+	if err := h.transport.RemoveSubscriber(ctx, s); err != nil {
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Failed to remove subscriber on shutdown", slog.Any("error", err))
+		}
+
+		// Override only when the loop didn't already classify the exit:
+		// a write_failed → transport-RemoveSubscriber error chain should
+		// keep the more specific write_failed attribution.
+		if reason == DisconnectReasonUnknown {
+			reason = DisconnectReasonTransportError
+		}
 	}
 
 	h.dispatchSubscriptionUpdate(ctx, s, false)
 
 	if h.logger.Enabled(ctx, slog.LevelInfo) {
-		h.logger.LogAttrs(ctx, slog.LevelInfo, "Subscriber disconnected")
+		h.logger.LogAttrs(
+			ctx, slog.LevelInfo, "Subscriber disconnected",
+			slog.Any("subscriber", &s.Subscriber),
+			slog.String("reason", string(reason)),
+		)
+	}
+
+	if r, ok := h.metrics.(DisconnectReasonReporter); ok {
+		r.SubscriberDisconnectedWithReason(s, reason)
+
+		return
 	}
 
 	h.metrics.SubscriberDisconnected(s)

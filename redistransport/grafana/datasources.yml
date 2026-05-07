@@ -1,0 +1,29 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: "5s"
+
+  # Jaeger is only reachable under the tracing profile (`task dev:full:tracing`).
+  # Provisioning never tests connectivity, and Grafana does not background-poll
+  # an unused datasource, so this entry is inert in the default metrics-only
+  # loop — it has no consumer there (the trace panels live in their own
+  # transport-tracing.json dashboard, which an operator only opens when tracing
+  # is on). When tracing is up, this resolves http://jaeger:16686 for the
+  # single-pane metrics↔traces view.
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    isDefault: false
+    jsonData:
+      # Link Jaeger spans back to the transport metrics dashboard for the
+      # operator's drill-down loop (trace → the RED metrics for that backend).
+      tracesToMetrics:
+        datasourceUid: prometheus

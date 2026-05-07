@@ -3,6 +3,7 @@ package caddy
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"path/filepath"
 	"strconv"
 
@@ -15,6 +16,9 @@ func init() { //nolint:gochecknoinits
 	caddy.RegisterModule(&Bolt{})
 }
 
+// Bolt is the Caddy module wrapping the upstream BoltTransport.
+//
+//nolint:recvcheck // Caddy module convention: CaddyModule() uses a value receiver so caddy.RegisterModule can register a Module value, while behavior methods (Provision, Cleanup, UnmarshalCaddyfile, GetTransport) take *Bolt to mutate state.
 type Bolt struct {
 	Path             string  `json:"path,omitempty"`
 	BucketName       string  `json:"bucket_name,omitempty"`
@@ -38,23 +42,38 @@ func (b *Bolt) GetTransport() mercure.Transport { //nolint:ireturn
 }
 
 // Provision provisions b's configuration.
-//
-//nolint:wrapcheck
 func (b *Bolt) Provision(ctx caddy.Context) error {
 	if b.Path == "" {
 		b.Path = filepath.Join(caddy.AppDataDir(), "mercure.db")
 	}
 
+	// Normalize Path before gob-encoding the struct into the pool key. Without
+	// normalization, two configs pointing at the same file via different
+	// spellings (relative "./mercure.db" vs absolute "/abs/.../mercure.db")
+	// produce different pool keys, leading the second Provision into a bbolt
+	// file-lock collision instead of sharing the already-open transport.
+	absPath, err := filepath.Abs(b.Path)
+	if err != nil {
+		return fmt.Errorf("bolt transport: resolve absolute path: %w", err)
+	}
+
+	b.Path = absPath
+
 	var key bytes.Buffer
 	if err := gob.NewEncoder(&key).Encode(b); err != nil {
-		return err
+		return fmt.Errorf("bolt transport: encode pool key: %w", err)
 	}
 
 	b.transportKey = key.String()
 
+	cacheSize, ok := ctx.Value(SubscriberListCacheSizeContextKey).(int)
+	if !ok {
+		return fmt.Errorf("bolt transport: %w (key=%T)", ErrSubscriberListCacheSizeMissing, SubscriberListCacheSizeContextKey)
+	}
+
 	destructor, _, err := TransportUsagePool.LoadOrNew(b.transportKey, func() (caddy.Destructor, error) {
 		t, err := mercure.NewBoltTransport(
-			mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
+			mercure.NewSubscriberList(cacheSize),
 			ctx.Slogger(),
 			b.Path,
 			b.BucketName,
@@ -62,25 +81,31 @@ func (b *Bolt) Provision(ctx caddy.Context) error {
 			b.CleanupFrequency,
 		)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("new bolt transport: %w", err)
 		}
 
 		return TransportDestructor[*mercure.BoltTransport]{Transport: t}, nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("bolt transport pool: %w", err)
 	}
 
-	b.transport = destructor.(TransportDestructor[*mercure.BoltTransport]).Transport
+	td, ok := destructor.(TransportDestructor[*mercure.BoltTransport])
+	if !ok {
+		return fmt.Errorf("bolt transport: %w: pool returned %T, expected TransportDestructor[*mercure.BoltTransport]", errTransportPoolDestructorMismatch, destructor)
+	}
+
+	b.transport = td.Transport
 
 	return nil
 }
 
-//nolint:wrapcheck
 func (b *Bolt) Cleanup() error {
-	_, err := TransportUsagePool.Delete(b.transportKey)
+	if _, err := TransportUsagePool.Delete(b.transportKey); err != nil {
+		return fmt.Errorf("bolt transport cleanup: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens.

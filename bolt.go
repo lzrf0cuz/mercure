@@ -76,6 +76,8 @@ func NewBoltTransport(
 
 	lastEventID, err := getDBLastEventID(db, bucketName)
 	if err != nil {
+		_ = db.Close()
+
 		return nil, &TransportError{err: err}
 	}
 
@@ -123,7 +125,11 @@ func (t *BoltTransport) Dispatch(ctx context.Context, update *Update) error {
 
 	update.AssignUUID()
 
-	updateJSON, err := json.Marshal(*update)
+	// Pass *Update by pointer rather than dereferencing — the embedded
+	// sync.Once on Update makes the struct non-copyable (go vet reports
+	// "call of json.Marshal copies lock value" on json.Marshal(*update)).
+	// json.Marshal produces identical output for both forms.
+	updateJSON, err := json.Marshal(update)
 	if err != nil {
 		return fmt.Errorf("error when marshaling update: %w", err)
 	}
@@ -158,6 +164,14 @@ func (t *BoltTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) e
 
 	if s.RequestLastEventID != "" {
 		if err := t.dispatchHistory(ctx, s, toSeq); err != nil {
+			// Roll back the subscriber registration so the failed
+			// add does not leak into t.subscribers — the HTTP
+			// handler's defer RemoveSubscriber never runs because
+			// AddSubscriber returned an error.
+			t.Lock()
+			t.subscribers.Remove(s)
+			t.Unlock()
+
 			return err
 		}
 	}
@@ -315,8 +329,8 @@ func (t *BoltTransport) dispatchHistory(ctx context.Context, s *LocalSubscriber,
 		s.HistoryDispatched(responseLastEventID)
 
 		if !afterFromID {
-			if t.logger.Enabled(ctx, slog.LevelInfo) {
-				t.logger.LogAttrs(ctx, slog.LevelInfo, "Can't find requested LastEventID")
+			if t.logger.Enabled(ctx, slog.LevelWarn) {
+				t.logger.LogAttrs(ctx, slog.LevelWarn, "Requested Last-Event-ID not found in history", slog.String("subscriber", s.ID), slog.String("last_event_id", s.RequestLastEventID))
 			}
 		}
 
@@ -354,12 +368,12 @@ func (t *BoltTransport) persist(updateID string, updateJSON []byte) error {
 		// The DB is append-only
 		bucket.FillPercent = 1
 
-		t.lastSeq = seq
-		t.lastEventID = updateID
-
 		if err := bucket.Put(key, updateJSON); err != nil {
 			return fmt.Errorf("unable to put value in Bolt DB: %w", err)
 		}
+
+		t.lastSeq = seq
+		t.lastEventID = updateID
 
 		return t.cleanup(bucket, seq)
 	}); err != nil {
@@ -374,19 +388,23 @@ func (t *BoltTransport) cleanup(bucket *bolt.Bucket, lastID uint64) error {
 	if t.size == 0 ||
 		t.cleanupFrequency == 0 ||
 		t.size >= lastID ||
-		(t.cleanupFrequency != 1 && rand.Float64() < t.cleanupFrequency) { //nolint:gosec
+		(t.cleanupFrequency != 1 && rand.Float64() >= t.cleanupFrequency) { //nolint:gosec
 		return nil
 	}
 
 	removeUntil := lastID - t.size
 
+	// bbolt's documented pattern for deletion during iteration is c.Delete(),
+	// not bucket.Delete(k): the latter invalidates the cursor's position and
+	// risks skipping entries on the next c.Next(). c.Delete() removes the
+	// current key while leaving the cursor positioned for safe advancement.
 	c := bucket.Cursor()
 	for k, _ := c.First(); k != nil; k, _ = c.Next() {
 		if binary.BigEndian.Uint64(k[:8]) > removeUntil {
 			break
 		}
 
-		if err := bucket.Delete(k); err != nil {
+		if err := c.Delete(); err != nil {
 			return fmt.Errorf("unable to delete value in Bolt DB: %w", err)
 		}
 	}

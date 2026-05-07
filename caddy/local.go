@@ -1,6 +1,8 @@
 package caddy
 
 import (
+	"fmt"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/dunglas/mercure"
@@ -14,6 +16,9 @@ func init() { //nolint:gochecknoinits
 	caddy.RegisterModule(&Local{})
 }
 
+// Local is the Caddy module wrapping the upstream LocalTransport.
+//
+//nolint:recvcheck // Caddy module convention: CaddyModule() uses a value receiver so caddy.RegisterModule can register a Module value, while behavior methods take *Local to mutate state.
 type Local struct {
 	transport *mercure.LocalTransport
 }
@@ -32,15 +37,26 @@ func (l *Local) GetTransport() mercure.Transport { //nolint:ireturn
 
 // Provision provisions l's configuration.
 func (l *Local) Provision(ctx caddy.Context) error {
-	destructor, _, _ := TransportUsagePool.LoadOrNew(localTransportKey, func() (caddy.Destructor, error) {
+	cacheSize, ok := ctx.Value(SubscriberListCacheSizeContextKey).(int)
+	if !ok {
+		return fmt.Errorf("local transport: %w (key=%T)", ErrSubscriberListCacheSizeMissing, SubscriberListCacheSizeContextKey)
+	}
+
+	destructor, _, err := TransportUsagePool.LoadOrNew(localTransportKey, func() (caddy.Destructor, error) {
 		return TransportDestructor[*mercure.LocalTransport]{
-			Transport: mercure.NewLocalTransport(
-				mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
-			),
+			Transport: mercure.NewLocalTransport(mercure.NewSubscriberList(cacheSize)),
 		}, nil
 	})
+	if err != nil {
+		return fmt.Errorf("local transport pool: %w", err)
+	}
 
-	l.transport = destructor.(TransportDestructor[*mercure.LocalTransport]).Transport
+	td, ok := destructor.(TransportDestructor[*mercure.LocalTransport])
+	if !ok {
+		return fmt.Errorf("local transport: %w: pool returned %T, expected TransportDestructor[*mercure.LocalTransport]", errTransportPoolDestructorMismatch, destructor)
+	}
+
+	l.transport = td.Transport
 
 	return nil
 }
@@ -58,7 +74,7 @@ func (l *Local) UnmarshalCaddyfile(_ *caddyfile.Dispenser) error {
 }
 
 var (
-	_ caddy.Provisioner     = (*Bolt)(nil)
-	_ caddy.CleanerUpper    = (*Bolt)(nil)
-	_ caddyfile.Unmarshaler = (*Bolt)(nil)
+	_ caddy.Provisioner     = (*Local)(nil)
+	_ caddy.CleanerUpper    = (*Local)(nil)
+	_ caddyfile.Unmarshaler = (*Local)(nil)
 )

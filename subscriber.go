@@ -29,6 +29,15 @@ func NewSubscriber(logger *slog.Logger, topicSelectorStore *TopicSelectorStore) 
 	}
 }
 
+// SetTopicSelectorStore sets the topic selector store on the subscriber.
+// This is needed for deserialized cross-node subscribers that lack the
+// unexported topicSelectorStore field after JSON round-tripping. Without
+// the store, MatchTopics() would panic with a nil pointer dereference on
+// topic-filtered subscription queries.
+func (s *Subscriber) SetTopicSelectorStore(store *TopicSelectorStore) {
+	s.topicSelectorStore = store
+}
+
 // SetTopics compiles topic selector regexps.
 func (s *Subscriber) SetTopics(subscribedTopics, allowedPrivateTopics []string) {
 	s.SubscribedTopics = subscribedTopics
@@ -49,6 +58,12 @@ func escapeTopics(topics []string) []string {
 //
 //nolint:gocognit
 func (s *Subscriber) MatchTopics(topics []string, private bool) bool {
+	if s.topicSelectorStore == nil {
+		// Cross-node deserialized subscriber whose caller did not call
+		// SetTopicSelectorStore. Treat as no match rather than panic.
+		return false
+	}
+
 	var subscribed bool
 
 	canAccess := !private
@@ -91,10 +106,46 @@ func (s *Subscriber) Match(u *Update) bool {
 	return s.MatchTopics(u.Topics, u.Private)
 }
 
+// maxObservedEventIDLen bounds how much of a client-supplied Last-Event-ID is
+// copied into a log record. Last-Event-ID arrives as an HTTP header / query
+// param bounded only by the server's max-header size (~1 MiB), so logging it
+// verbatim lets one oversized value bloat every log line that includes the
+// subscriber (LogValue fans out to several call sites). A valid UUIDv7 ID is
+// 36 chars; 80 leaves headroom for custom publisher IDs. redistransport caps
+// the same client value to the same length on its observability paths — keep
+// the two in sync.
+const maxObservedEventIDLen = 80
+
+// truncateEventIDForObservability rune-safely caps a client-controlled event
+// ID for safe inclusion in logs. Truncation is observability-only — the full
+// RequestLastEventID is still used for history-replay seeking. The common
+// case (a UUIDv7 ID, 36 bytes) is a single length check with no allocation;
+// only an over-cap value walks the string to find the rune boundary at the
+// cap, deliberately avoiding the whole-string allocation a naive
+// []rune(id)[:n] would incur on an attacker-bounded (~1 MiB) input.
+func truncateEventIDForObservability(id string) string {
+	if len(id) <= maxObservedEventIDLen { // byte len >= rune len, so this is a safe fast path
+		return id
+	}
+
+	runes := 0
+	for i := range id {
+		if runes == maxObservedEventIDLen {
+			return id[:i] + "…(truncated)"
+		}
+
+		runes++
+	}
+
+	// Fewer than maxObservedEventIDLen runes despite >maxObservedEventIDLen
+	// bytes (multi-byte content): already within the rune cap.
+	return id
+}
+
 func (s *Subscriber) LogValue() slog.Value {
 	attrs := []slog.Attr{
 		slog.String("id", s.ID),
-		slog.String("last_event_id", s.RequestLastEventID),
+		slog.String("last_event_id", truncateEventIDForObservability(s.RequestLastEventID)),
 	}
 
 	if s.AllowedPrivateTopics != nil {

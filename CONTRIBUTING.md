@@ -45,12 +45,23 @@ To run the test suite:
 
     go test -v -timeout 30s github.com/dunglas/mercure
 
-To test the Caddy module:
+To test the Caddy module with HS256 (shared secret):
 
     cd caddy/mercure
-    MERCURE_PUBLISHER_JWT_KEY='!ChangeThisMercureHubJWTSecretKey!' MERCURE_SUBSCRIBER_JWT_KEY='!ChangeThisMercureHubJWTSecretKey!' go run -tags deprecated_transport,nobadger,nomysql,nopgx main.go run --config ../../dev.Caddyfile
+    MERCURE_PUBLISHER_JWT_KEY='!ChangeThisMercureHubJWTSecretKey!' \
+    MERCURE_SUBSCRIBER_JWT_KEY='!ChangeThisMercureHubJWTSecretKey!' \
+    go run -tags deprecated_transport,nobadger,nomysql,nopgx main.go run --config ../../dev.Caddyfile
 
-Go to `https://localhost` and enjoy!
+Or with RS256 (asymmetric RSA keys from `fixtures/jwt/`):
+
+    cd caddy/mercure
+    MERCURE_PUBLISHER_JWT_KEY="$(cat ../../fixtures/jwt/RS256.key.pub)" \
+    MERCURE_PUBLISHER_JWT_ALG=RS256 \
+    MERCURE_SUBSCRIBER_JWT_KEY="$(cat ../../fixtures/jwt/RS256.key.pub)" \
+    MERCURE_SUBSCRIBER_JWT_ALG=RS256 \
+    go run -tags deprecated_transport,nobadger,nomysql,nopgx main.go run --config ../../dev.Caddyfile
+
+Go to `https://localhost` and enjoy! For the RS256 variant, switch the UI's algorithm toggle to RS256.
 
 To test the legacy server:
 
@@ -80,6 +91,30 @@ To debug potential deadlocks:
 2. Run the tests in race mode: `go test -race ./... -v`
 3. To stress-test the app, run the load test (see `docs/load-testing.md`)
 4. Be sure to remove `go-deadlock` before committing
+
+### Avoiding silent failures
+
+Do not fold an `err != nil` check into the same boolean expression as a
+log-level gate. The compound short-circuits when the level is disabled,
+skipping any control-flow inside the `if` body — including `return` /
+`return false` / `return err`. Two real instances of this shape lived in
+`subscribe.go` (write and dispatch-deadline paths) and silently
+misclassified disconnect reasons at the default INFO log level.
+
+    // Wrong — at WARN+ the err check is false, the body is skipped, and the
+    // caller gets a misleading "success" return:
+    if _, err := w.Write(b); err != nil && h.logger.Enabled(ctx, slog.LevelDebug) {
+        h.logger.LogAttrs(ctx, slog.LevelDebug, "Write failed", slog.Any("error", err))
+        return false
+    }
+
+    // Right — control flow always fires on error; only the log line is gated:
+    if _, err := w.Write(b); err != nil {
+        if h.logger.Enabled(ctx, slog.LevelDebug) {
+            h.logger.LogAttrs(ctx, slog.LevelDebug, "Write failed", slog.Any("error", err))
+        }
+        return false
+    }
 
 ## Spec
 

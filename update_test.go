@@ -54,3 +54,52 @@ func TestLogUpdate(t *testing.T) {
 	assert.Contains(t, log, `"private":true`)
 	assert.Contains(t, log, `"data":"bar"`)
 }
+
+func TestNewSerializedUpdateCachesSSE(t *testing.T) {
+	t.Parallel()
+
+	u := &Update{
+		Topics: []string{"https://example.com/test"},
+		Event:  Event{ID: "test-id", Data: "hello world", Type: "message"},
+	}
+
+	// First call should serialize and cache.
+	su1 := newSerializedUpdate(u)
+	assert.Contains(t, su1.event, "id: test-id")
+	assert.Contains(t, su1.event, "data: hello world")
+	assert.Contains(t, su1.event, "event: message")
+
+	// Second call should return the same cached string (same pointer content).
+	su2 := newSerializedUpdate(u)
+	assert.Equal(t, su1.event, su2.event)
+}
+
+func TestNewSerializedUpdateConcurrent(t *testing.T) {
+	t.Parallel()
+
+	u := &Update{
+		Topics: []string{"https://example.com/concurrent"},
+		Event:  Event{ID: "concurrent-id", Data: "concurrent data"},
+	}
+
+	// Call from multiple goroutines — must not race.
+	done := make(chan string, 100)
+
+	for range 100 {
+		go func() {
+			su := newSerializedUpdate(u)
+			done <- su.event
+		}()
+	}
+
+	var first string
+
+	for range 100 {
+		result := <-done
+		if first == "" {
+			first = result
+		}
+
+		assert.Equal(t, first, result, "all goroutines must get the same cached SSE")
+	}
+}

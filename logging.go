@@ -28,6 +28,8 @@ func (m mercureHandler) Handle(ctx context.Context, record slog.Record) error {
 	var attrs []slog.Attr
 
 	if u, ok := ctx.Value(UpdateContextKey).(*Update); ok {
+		// slog.Any invokes Update.LogValue, which is bounded by design
+		// (no Type/Data by default). See update.go for the contract.
 		attrs = append(attrs, slog.Any("update", u))
 	}
 
@@ -45,9 +47,9 @@ func (m mercureHandler) Handle(ctx context.Context, record slog.Record) error {
 }
 
 func (m mercureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return m.innerHandler.WithAttrs(attrs)
+	return &mercureHandler{m.innerHandler.WithAttrs(attrs)}
 }
 
 func (m mercureHandler) WithGroup(name string) slog.Handler {
-	return m.innerHandler.WithGroup(name)
+	return &mercureHandler{m.innerHandler.WithGroup(name)}
 }

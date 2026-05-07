@@ -25,6 +25,12 @@ type Event struct {
 }
 
 // String serializes the event in a "text/event-stream" representation.
+//
+// Type and ID are written verbatim as SSE field values; Data is line-escaped by
+// dataReplacer, Retry is numeric (cannot carry control chars), and Topics are not
+// part of the frame. Any STRING field added here that is written verbatim must
+// also be covered by Update.ValidateSSEFields, the receive-side injection guard
+// that trusts this method's field list.
 func (e *Event) String() string {
 	var b strings.Builder
 

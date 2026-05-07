@@ -602,7 +602,7 @@ func TestAuthorizeCookieInvalidAlg(t *testing.T) {
 	for _, testdata := range authTestData {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyNoneSignedJWT()})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyNoneSignedJWT(), HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm))
 
@@ -625,7 +625,7 @@ func TestAuthorizeCookieInvalidKey(t *testing.T) {
 			}
 
 			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte{}, testdata.algorithm))
 
@@ -643,7 +643,7 @@ func TestAuthorizeCookieInvalidSignature(t *testing.T) {
 	for _, testdata := range authTestData {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty[:len(testdata.validEmpty)-8] + "12345678"})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty[:len(testdata.validEmpty)-8] + "12345678", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm))
 
@@ -661,7 +661,7 @@ func TestAuthorizeCookieNoContent(t *testing.T) {
 	for _, testdata := range authTestData {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.validEmpty, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm))
 
@@ -679,7 +679,7 @@ func TestAuthorizeCookie(t *testing.T) {
 	for _, testdata := range authTestData {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodGet, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm))
 
@@ -697,7 +697,7 @@ func TestAuthorizeCookieNoOriginNoReferer(t *testing.T) {
 	for _, testdata := range authTestData {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm))
 
@@ -717,7 +717,7 @@ func TestAuthorizeCookieOriginNotAllowed(t *testing.T) {
 
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Origin", "https://example.com")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"https://example.net"}))
 
@@ -737,7 +737,7 @@ func TestAuthorizeCookieRefererNotAllowed(t *testing.T) {
 
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Referer", "https://example.com/foo/bar")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"https://example.net"}))
 
@@ -757,7 +757,7 @@ func TestAuthorizeCookieInvalidReferer(t *testing.T) {
 
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Referer", "https://192.168.0.%31/")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithSubscriberJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"https://example.net"}))
 
@@ -776,7 +776,7 @@ func TestAuthorizeCookieOriginHasPriority(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Origin", "https://example.net")
 			r.Header.Add("Referer", "https://example.com")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithPublisherJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"https://example.net"}), WithCookieName(defaultCookieName))
 
@@ -795,7 +795,7 @@ func TestAuthorizeAllOriginsAllowed(t *testing.T) {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Origin", "https://example.com")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithPublisherJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"*"}))
 
@@ -812,7 +812,7 @@ func TestAuthorizeWildcardOrigins(t *testing.T) {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Origin", "https://foo.example.com")
-			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: defaultCookieName, Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithPublisherJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"https://*.example.com"}))
 
@@ -829,7 +829,7 @@ func TestAuthorizeCustomCookieName(t *testing.T) {
 		t.Run(testdata.algorithm, func(t *testing.T) {
 			r, _ := http.NewRequest(http.MethodPost, defaultHubURL, nil)
 			r.Header.Add("Origin", "https://example.com")
-			r.AddCookie(&http.Cookie{Name: "foo", Value: testdata.valid})
+			r.AddCookie(&http.Cookie{Name: "foo", Value: testdata.valid, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
 
 			h := createDummy(t, WithPublisherJWT([]byte(testdata.publicKey), testdata.algorithm), WithPublishOrigins([]string{"*"}), WithCookieName("foo"))
 

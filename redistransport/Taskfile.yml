@@ -1,0 +1,789 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+#
+# redistransport Taskfile — development, CI, and operational targets for the
+# Redis/Valkey transport module.
+#
+# Conventions:
+#   • Namespacing: colons split ns:verb:subverb (e.g. test:real:redis).
+#   • User-facing tasks declare desc:; internal helpers set internal: true
+#     and are prefixed with an underscore (_check:docker, _test:real:...).
+#   • Mutating commands (fmt, clean) NEVER run in ci:. Use fmt:check — it
+#     exits non-zero when files would be rewritten.
+#   • Docker-touching tasks declare _check:docker as a dep so first-run
+#     failures print a useful message instead of a raw compose error.
+#   • `:all` variants compose a module-root task with its :caddy counterpart
+#     so both Go modules stay in lock-step.
+#
+# Invoked from the repo root, tasks are namespaced rt:* via the root
+# Taskfile.yml includes (e.g. task rt:test, task rt:redis:up).
+
+version: '3'
+
+# Globals match the root Taskfile.yml (silent + prefixed output) so
+# rt:* subtasks invoked from the repo root produce consistent output
+# with the root tasks. Per-task `silent: false` can locally override
+# when verbose output is desired (e.g. cluster bootstrap).
+#
+# Note on env loading: go-task forbids `dotenv:` in included Taskfiles,
+# so this file relies on the root Taskfile.yml's `dotenv: ['.env.local',
+# '.env.dev']` for env propagation. Tasks here MUST be invoked via the
+# rt:* namespace from the repo root (e.g. `task rt:redis:up`); direct
+# invocation from this directory (`cd redistransport && task redis:up`)
+# will not see MERCURE_*/REDIS_*/SERVER_NAME env vars.
+
+output: prefixed
+silent: true
+
+vars:
+  CADDY_DIR: ../caddy/mercure
+  REDIS_COMPOSE: compose.redis.yaml
+  VALKEY_COMPOSE: compose.valkey.yaml
+  CLUSTER_COMPOSE: compose.cluster.yaml
+  CONFORMANCE_CADDYFILE: conformance.Caddyfile
+  CONFORMANCE_HUB_PID: /tmp/rt-conformance-hub.pid
+  GO_BUILD_TAGS: nobadger,nomysql,nopgx
+  TEST_TIMEOUT: 120s
+  BENCH_TIMEOUT: 300s
+  # Source of truth for the transport's release version. Injected via -ldflags
+  # so the mercure_redis_build_info{version="..."} label reflects the package
+  # version rather than the "dev" devVersion sentinel that resolveVersion
+  # falls back to under a `replace`-based local build (caddy/go.mod points
+  # redistransport at ../redistransport).
+  RT_VERSION: 0.0.1
+
+  # Container image pins (SSOT) — the compose.* files reference these via the env
+  # block below, so every image version lives in one place instead of inline.
+  REDIS_IMAGE: redis:7-alpine
+  VALKEY_IMAGE: valkey/valkey:8-alpine
+  REDISINSIGHT_IMAGE: redis/redisinsight:3.4.2
+  CURL_IMAGE: curlimages/curl:8.11.1
+  PROMETHEUS_IMAGE: prom/prometheus:v3.11.3
+  GRAFANA_IMAGE: grafana/grafana:12.4.3
+  JAEGER_IMAGE: jaegertracing/all-in-one:1.62.0
+  REDIS_EXPORTER_IMAGE: oliver006/redis_exporter:v1.83.0-alpine
+
+# Export the image pins so the compose.* files interpolate them (compose runs as
+# a child of the task command and inherits this environment).
+env:
+  REDIS_IMAGE: "{{.REDIS_IMAGE}}"
+  VALKEY_IMAGE: "{{.VALKEY_IMAGE}}"
+  REDISINSIGHT_IMAGE: "{{.REDISINSIGHT_IMAGE}}"
+  CURL_IMAGE: "{{.CURL_IMAGE}}"
+  PROMETHEUS_IMAGE: "{{.PROMETHEUS_IMAGE}}"
+  GRAFANA_IMAGE: "{{.GRAFANA_IMAGE}}"
+  JAEGER_IMAGE: "{{.JAEGER_IMAGE}}"
+  REDIS_EXPORTER_IMAGE: "{{.REDIS_EXPORTER_IMAGE}}"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  # ============================================
+  # Code quality — lint, vet, vuln, fmt, markdown
+  # ============================================
+  lint:
+    desc: golangci-lint — root module
+    preconditions:
+      - sh: command -v golangci-lint >/dev/null
+        msg: "golangci-lint not found. Install: brew install golangci-lint"
+    cmds:
+      - golangci-lint run ./...
+
+  lint:caddy:
+    desc: golangci-lint — caddy submodule
+    dir: caddy
+    preconditions:
+      - sh: command -v golangci-lint >/dev/null
+        msg: "golangci-lint not found. Install: brew install golangci-lint"
+    cmds:
+      - golangci-lint run ./...
+
+  lint:all:
+    desc: Lint both modules + Grafana dashboard JSON (general best-practice rules; domain invariants run under rt:test)
+    cmds:
+      - task: lint
+      - task: lint:real
+      - task: lint:caddy
+      - task: lint:dashboard
+
+  # Grafana Labs' dashboard-linter, run with `--strict` so findings exit
+  # non-zero. Per-panel exclusions for the redis_exporter sidecar panels
+  # live in grafana/dashboards/.lint (those panels query a different
+  # scrape job and cannot meaningfully use $job/$instance).
+  #
+  # Domain-specific invariants (legendFormat↔aggregator-by-clause for
+  # backend_type and instance, guarded $__all defaults, $backend_type
+  # selector, .lint drift, instance-prefix shape) are enforced separately
+  # in dashboard_lint_test.go and run under `task rt:test`. Common
+  # dashboard-linter failure on new panels: missing description, missing
+  # $__rate_interval on rate(_total), non-templated datasource. The
+  # diagnostic names the offending panel. Version pinned to v0.1.1 in
+  # the install hint — keep in sync with root Taskfile.yml's
+  # `dashboard:lint` task when bumping.
+  lint:dashboard:
+    desc: Lint Grafana dashboard JSON with grafana/dashboard-linter --strict
+    dir: grafana/dashboards
+    preconditions:
+      - sh: command -v dashboard-linter >/dev/null
+        msg: |
+          dashboard-linter not found. Install (upstream `go install` is broken
+          by a replace directive in their go.mod — use the prebuilt release):
+
+            mkdir -p "$(go env GOPATH)/bin" && curl --fail -sSL \
+              "https://github.com/grafana/dashboard-linter/releases/download/v0.1.1/dashboard-linter_0.1.1_$(uname -s | tr A-Z a-z)_$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/').tar.gz" \
+              | tar -xz -C "$(go env GOPATH)/bin" dashboard-linter
+    cmds:
+      - dashboard-linter lint --strict transport.json
+      - 'printf "Grafana dashboard JSON: clean (general + .lint exclusions applied)\n"'
+
+  lint:real:
+    desc: golangci-lint — root module with the real_redis build tag (covers integration_real_*.go)
+    preconditions:
+      - sh: command -v golangci-lint >/dev/null
+        msg: "golangci-lint not found. Install: brew install golangci-lint"
+    cmds:
+      - golangci-lint run --build-tags=real_redis ./...
+
+  vet:
+    desc: go vet — root module
+    cmds:
+      - go vet ./...
+
+  vet:caddy:
+    desc: go vet — caddy submodule
+    dir: caddy
+    cmds:
+      - go vet ./...
+
+  vet:all:
+    desc: Vet both modules (root + caddy)
+    cmds:
+      - task: vet
+      - task: vet:caddy
+
+  vuln:
+    desc: govulncheck — root module
+    preconditions:
+      - sh: command -v govulncheck >/dev/null
+        msg: "govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"
+    cmds:
+      - govulncheck ./...
+
+  vuln:caddy:
+    desc: govulncheck — caddy submodule
+    dir: caddy
+    preconditions:
+      - sh: command -v govulncheck >/dev/null
+        msg: "govulncheck not found. Install: go install golang.org/x/vuln/cmd/govulncheck@latest"
+    cmds:
+      - govulncheck ./...
+
+  vuln:all:
+    desc: Vulnerability scan both modules
+    cmds:
+      - task: vuln
+      - task: vuln:caddy
+
+  fmt:
+    desc: Format Go source with gofumpt — mutates tree (rt root + caddy submodule)
+    preconditions:
+      - sh: command -v gofumpt >/dev/null
+        msg: "gofumpt not found. Install: go install mvdan.cc/gofumpt@latest"
+    cmds:
+      # Single invocation: `gofumpt -w .` walks the tree and processes
+      # every .go file under redistransport/, including caddy/ submodule.
+      # gofumpt does not honor go.mod boundaries — it formats by file
+      # walk, so one pass covers both modules. (gofumpt's own skip list
+      # is `vendor/` + `testdata/`; the rt subtree contains neither.)
+      - gofumpt -w .
+
+  fmt:check:
+    desc: Verify gofumpt formatting — CI-safe, exits 1 when files need formatting
+    preconditions:
+      - sh: command -v gofumpt >/dev/null
+        msg: "gofumpt not found. Install: go install mvdan.cc/gofumpt@latest"
+    cmds:
+      - |
+        set -euo pipefail
+        out=$(gofumpt -l .)
+        if [ -n "$out" ]; then
+          printf "Files need formatting:\n%s\n" "$out"
+          exit 1
+        fi
+
+  md:lint:
+    desc: Lint Markdown with rumdl (uses local .rumdl.toml)
+    preconditions:
+      - sh: command -v rumdl >/dev/null
+        msg: "rumdl not found. Install: pipx install rumdl"
+    cmds:
+      - rumdl check -c .rumdl.toml .
+
+  md:fmt:
+    desc: Auto-fix Markdown with rumdl (uses local .rumdl.toml)
+    preconditions:
+      - sh: command -v rumdl >/dev/null
+        msg: "rumdl not found. Install: pipx install rumdl"
+    cmds:
+      - rumdl fmt -c .rumdl.toml .
+
+  # ============================================
+  # Tests — miniredis unit, short, real Redis/Valkey, stress, coverage
+  # ============================================
+  test:
+    desc: Transport tests (miniredis, race, coverage)
+    cmds:
+      - go test -race -count=1 -timeout {{.TEST_TIMEOUT}} -covermode=atomic -coverprofile=coverage.out ./...
+
+  test:caddy:
+    desc: Caddy submodule tests (race)
+    dir: caddy
+    cmds:
+      - go test -race -count=1 -timeout 60s ./...
+
+  test:all:
+    desc: Run tests in both modules
+    cmds:
+      - task: test
+      - task: test:caddy
+
+  test:short:
+    desc: Tests without race detector (faster smoke check)
+    cmds:
+      - go test -count=1 -timeout 60s ./...
+
+  # Race-stress repeat: same race coverage as test/test:caddy, but -count=5
+  # to surface schedule-dependent races that a single pass would miss. Tier 2
+  # only — too slow for the PR-gate `task ci`.
+  test:race:repeat:
+    desc: Race stress (-race -count=5) — root module — tier 2
+    cmds:
+      - go test -race -count=5 -timeout {{.TEST_TIMEOUT}} ./...
+
+  test:race:repeat:caddy:
+    desc: Race stress (-race -count=5) — caddy submodule — tier 2
+    dir: caddy
+    cmds:
+      - go test -race -count=5 -timeout 60s ./...
+
+  test:race:repeat:all:
+    desc: Race stress in both modules (tier 2)
+    cmds:
+      - task: test:race:repeat
+      - task: test:race:repeat:caddy
+
+  test:real:
+    desc: Real Redis/Valkey integration tests (requires a running server at REDIS_ADDR)
+    env:
+      REDIS_ADDR: '{{.REDIS_ADDR | default "localhost:6379"}}'
+    cmds:
+      - go test -race -count=1 -tags=real_redis -timeout 60s -run 'TestReal_' ./...
+
+  test:real:stress:
+    desc: Concurrent-churn deadlock stress test (requires a running server)
+    env:
+      REDIS_ADDR: '{{.REDIS_ADDR | default "localhost:6379"}}'
+    cmds:
+      - go test -race -count=1 -tags=real_redis -timeout 60s -run 'TestRealStress' ./...
+
+  test:real:multihub:
+    desc: Multi-hub integration suite — cross-node dispatch/presence/GC/stress (requires a running server)
+    env:
+      REDIS_ADDR: '{{.REDIS_ADDR | default "localhost:6379"}}'
+    cmds:
+      - go test -race -count=1 -tags=real_redis -timeout 180s -run 'TestReal_MultiHub' ./...
+
+  _test:real:cluster:run:
+    internal: true
+    desc: Cluster integration suite (requires a running cluster at REDIS_CLUSTER_ADDRS)
+    env:
+      REDIS_CLUSTER_ADDRS: '{{.REDIS_CLUSTER_ADDRS | default "127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"}}'
+    cmds:
+      # Matches TestReal_Cluster_* (functional) and TestRealStress_Cluster_*
+      # (concurrency stress against ClusterClient pool/topology refresh).
+      - go test -race -count=1 -tags=real_redis -timeout 60s -run 'TestReal_Cluster_|TestRealStress_Cluster_' ./...
+
+  # Parameterized backend runner: spins up BACKEND, runs TEST_TASK, tears down.
+  # Used by the four test:real:{backend} wrappers below to avoid copy-paste.
+  _test:real:with:backend:
+    internal: true
+    requires:
+      vars: [BACKEND, TEST_TASK]
+    cmds:
+      - task: "{{.BACKEND}}:up"
+      - defer: {task: "{{.BACKEND}}:down"}
+      - task: "{{.TEST_TASK}}"
+
+  test:real:redis:
+    desc: Spin up Redis, run real-server test suite, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: redis, TEST_TASK: test:real}
+
+  test:real:valkey:
+    desc: Spin up Valkey, run real-server test suite against Valkey, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: valkey, TEST_TASK: test:real}
+
+  test:real:stress:redis:
+    desc: Spin up Redis, run only the stress test, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: redis, TEST_TASK: test:real:stress}
+
+  test:real:stress:valkey:
+    desc: Spin up Valkey, run only the stress test against Valkey, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: valkey, TEST_TASK: test:real:stress}
+
+  test:real:multihub:redis:
+    desc: Spin up Redis, run the multi-hub suite, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: redis, TEST_TASK: test:real:multihub}
+
+  test:real:multihub:valkey:
+    desc: Spin up Valkey, run the multi-hub suite against Valkey, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: valkey, TEST_TASK: test:real:multihub}
+
+  test:real:cluster:
+    desc: Spin up Redis Cluster (3 masters), run cluster integration suite, tear down
+    cmds:
+      - task: _test:real:with:backend
+        vars: {BACKEND: cluster, TEST_TASK: _test:real:cluster:run}
+
+  test:real:matrix:
+    desc: Real-server tests against Redis, Valkey, and Cluster (sequential)
+    cmds:
+      - task: test:real:redis
+      - task: test:real:valkey
+      - task: test:real:cluster
+
+  bench:
+    desc: Benchmarks (3s per bench, timing + allocs)
+    cmds:
+      - go test -bench=. -benchmem -benchtime=3s -timeout {{.TEST_TIMEOUT}} ./...
+
+  bench:profile:
+    desc: Benchmarks with CPU+mem pprof output to ./profiles
+    cmds:
+      - mkdir -p profiles
+      - go test -bench=. -benchmem -benchtime=3s -timeout {{.BENCH_TIMEOUT}} -cpuprofile=profiles/cpu.pprof -memprofile=profiles/mem.pprof -o profiles/bench.test ./...
+      - 'printf "CPU:     profiles/cpu.pprof\n"'
+      - 'printf "Memory:  profiles/mem.pprof\n"'
+      - 'printf "Binary:  profiles/bench.test (needed by pprof for symbol resolution)\n"'
+      - 'printf "Analyze: go tool pprof -http=:8080 profiles/bench.test profiles/cpu.pprof\n"'
+
+  cover:
+    desc: Run tests and render HTML coverage report
+    cmds:
+      - task: test
+      - go tool cover -func=coverage.out
+      - go tool cover -html=coverage.out -o coverage.html
+      - 'printf "Coverage report: coverage.html\n"'
+
+  # ============================================
+  # Build
+  # ============================================
+  build:
+    desc: go build — root module
+    cmds:
+      - go build ./...
+
+  build:caddy:
+    desc: go build — caddy submodule
+    dir: caddy
+    cmds:
+      - go build ./...
+
+  build:all:
+    desc: Build both modules
+    cmds:
+      - task: build
+      - task: build:caddy
+
+  build:binary:
+    desc: Build the Mercure binary (with this transport registered) from caddy/mercure
+    dir: "{{.CADDY_DIR}}"
+    cmds:
+      - go build -tags={{.GO_BUILD_TAGS}} -ldflags="-X github.com/lzrf0cuz/mercure/redistransport.version={{.RT_VERSION}}" -o mercure
+      - 'printf "Built %s/mercure (rt %s)\n" "{{.CADDY_DIR}}" "{{.RT_VERSION}}"'
+
+  # ============================================
+  # Compose stacks — Redis, Valkey + RedisInsight
+  # ============================================
+  _check:docker:
+    internal: true
+    preconditions:
+      - sh: docker info >/dev/null 2>&1
+        msg: "Docker daemon is not running (start Docker Desktop or run `orb start`)"
+    cmds:
+      - "true"
+
+  redis:up:
+    desc: Start Redis + RedisInsight stack (localhost:6379 + http://localhost:5540)
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} up -d
+      - 'printf "Waiting for Redis to become healthy...\n"'
+      - docker compose -f {{.REDIS_COMPOSE}} exec redis redis-cli ping
+      - 'printf "\nRedis ready at localhost:6379\n"'
+      - 'printf "RedisInsight UI at http://localhost:5540\n"'
+
+  redis:down:
+    desc: Stop Redis stack and remove volumes
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} down -v
+
+  redis:logs:
+    desc: Follow Redis stack logs
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} logs -f
+
+  redis:flush:
+    desc: FLUSHALL on the running Redis (clears stream + presence between load-test runs without restarting the container)
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} exec redis redis-cli FLUSHALL
+      - 'printf "Redis state cleared (stream + lastEventID + presence keys gone).\n"'
+
+  valkey:up:
+    desc: Start Valkey + RedisInsight stack (localhost:6379 + http://localhost:5540)
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} up -d
+      - 'printf "Waiting for Valkey to become healthy...\n"'
+      - docker compose -f {{.VALKEY_COMPOSE}} exec valkey valkey-cli ping
+      - 'printf "\nValkey ready at localhost:6379\n"'
+      - 'printf "RedisInsight UI at http://localhost:5540\n"'
+
+  valkey:down:
+    desc: Stop Valkey + RedisInsight stack and remove volumes
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} down -v
+
+  valkey:logs:
+    desc: Follow Valkey stack logs
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} logs -f
+
+  valkey:flush:
+    desc: FLUSHALL on the running Valkey (clears stream + presence between load-test runs without restarting the container)
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} exec valkey valkey-cli FLUSHALL
+      - 'printf "Valkey state cleared (stream + lastEventID + presence keys gone).\n"'
+
+  # redis:open and valkey:open are body-duplicates by design. Both stacks
+  # ship RedisInsight via the shared compose.redisinsight.yaml on :5540, but
+  # each stack-specific task is preserved so operators can tab-complete from
+  # whichever lifecycle namespace they're already in.
+  valkey:open:
+    desc: Open RedisInsight UI in default browser (Valkey stack)
+    cmds:
+      - open http://localhost:5540
+
+  redis:open:
+    desc: Open RedisInsight UI in default browser (Redis stack)
+    cmds:
+      - open http://localhost:5540
+
+  # ============================================
+  # Observability (Prometheus + Grafana) — opt-in via the `metrics` profile.
+  # Mutually exclusive with the root `compose.yaml` stack (container names
+  # and ports collide). The hub itself must run natively — the observability
+  # stack only provides the scrape + dashboard infrastructure. From the repo
+  # root: `task rt:go:run:redis`. From this dir: `task build:binary` then
+  # `cd {{.CADDY_DIR}} && ./mercure run -c ../../redistransport/redis-test.Caddyfile`.
+  # ============================================
+  metrics:up:redis:
+    desc: Start Prometheus + Grafana + Redis Exporter on the Redis stack
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} --profile metrics up -d prometheus grafana redis_exporter
+      - 'printf "\nPrometheus at http://localhost:9090\nGrafana at http://localhost:3000 (anonymous editor; admin/admin)\nRedis Exporter at http://localhost:9121/metrics\n"'
+
+  metrics:up:valkey:
+    desc: Start Prometheus + Grafana + Redis Exporter on the Valkey stack
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile metrics up -d prometheus grafana redis_exporter
+      - 'printf "\nPrometheus at http://localhost:9090\nGrafana at http://localhost:3000 (anonymous editor; admin/admin)\nRedis Exporter at http://localhost:9121/metrics\n"'
+
+  tracing:up:redis:
+    desc: Start the Jaeger sidecar on the Redis stack
+    # Brought up under REDIS_COMPOSE (not a bare `docker compose`) so Jaeger
+    # joins the same project network as Grafana. Without this, Grafana's Jaeger
+    # datasource (transport-tracing.json) can't resolve `jaeger` and the trace
+    # panel fails with a DNS error. The hub→Jaeger OTLP path uses host ports, so
+    # collection works either way; only the Grafana→Jaeger query needs co-networking.
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} --profile tracing up -d jaeger
+      - 'printf "\nJaeger UI at http://localhost:16686\n"'
+
+  tracing:down:redis:
+    desc: Stop + remove the Jaeger sidecar on the Redis stack
+    # Must use REDIS_COMPOSE to match tracing:up:redis — a bare `docker compose`
+    # targets a different project and would leave the Redis-stack Jaeger running.
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} --profile tracing stop jaeger
+      - docker compose -f {{.REDIS_COMPOSE}} --profile tracing rm -f jaeger
+
+  tracing:up:valkey:
+    desc: Start the Jaeger sidecar on the Valkey stack
+    # Valkey parity for tracing:up:redis (the Jaeger service is shared via the
+    # compose.observability.yaml include). dev:full:tracing is Redis-only, so
+    # this is the manual entry point for tracing the Valkey stack.
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile tracing up -d jaeger
+      - 'printf "\nJaeger UI at http://localhost:16686\n"'
+
+  tracing:down:valkey:
+    desc: Stop + remove the Jaeger sidecar on the Valkey stack
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile tracing stop jaeger
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile tracing rm -f jaeger
+
+  metrics:up:
+    desc: Alias — defaults to Redis (use metrics:up:valkey for the Valkey stack)
+    cmds:
+      - task: metrics:up:redis
+
+  metrics:down:redis:
+    desc: Stop Prometheus + Grafana + Redis Exporter on the Redis stack only
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.REDIS_COMPOSE}} --profile metrics rm -fsv prometheus grafana redis_exporter
+
+  metrics:down:valkey:
+    desc: Stop Prometheus + Grafana + Redis Exporter on the Valkey stack only
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile metrics rm -fsv prometheus grafana redis_exporter
+
+  metrics:down:
+    desc: Stop Prometheus + Grafana + Redis Exporter on whichever stack is up (safe to run against both)
+    deps: [_check:docker]
+    cmds:
+      # The unscoped variant deliberately targets "whichever stack is up", so
+      # it swallows the "no such service" stderr when the corresponding stack
+      # isn't running. The per-stack `metrics:down:redis` / `metrics:down:valkey`
+      # variants above DON'T swallow — they assume the operator knows which
+      # stack they started, so failures should propagate.
+      - docker compose -f {{.REDIS_COMPOSE}} --profile metrics rm -fsv prometheus grafana redis_exporter 2>/dev/null || true
+      - docker compose -f {{.VALKEY_COMPOSE}} --profile metrics rm -fsv prometheus grafana redis_exporter 2>/dev/null || true
+
+  metrics:open:
+    desc: Open Prometheus and Grafana UIs in default browser
+    cmds:
+      - open http://localhost:9090
+      - open http://localhost:3000
+
+  _cluster:certs:gen:
+    internal: true
+    desc: Generate self-signed test certs for the cluster TLS plane (mounted at /tls inside container)
+    sources:
+      - .tmp/cluster-certs/server.crt
+    generates:
+      - .tmp/cluster-certs/server.crt
+      - .tmp/cluster-certs/server.key
+    status:
+      - test -f .tmp/cluster-certs/server.crt
+    cmds:
+      - mkdir -p .tmp/cluster-certs
+      # CN=mercure-test, SAN=IP:127.0.0.1, 10-year validity. The cert is
+      # used as BOTH server cert and CA cert (self-signed is its own CA),
+      # adequate for tests that connect with InsecureSkipVerify.
+      - |
+        openssl req -x509 -newkey rsa:2048 \
+          -keyout .tmp/cluster-certs/server.key \
+          -out .tmp/cluster-certs/server.crt \
+          -days 3650 -nodes \
+          -subj "/CN=mercure-test" \
+          -addext "subjectAltName=IP:127.0.0.1" \
+          2>/dev/null
+      - chmod 644 .tmp/cluster-certs/server.crt .tmp/cluster-certs/server.key
+
+  cluster:up:
+    desc: Start Redis Cluster (3 masters, 127.0.0.1:7000-7002 plain + 8000-8002 TLS)
+    deps: [_check:docker, _cluster:certs:gen]
+    cmds:
+      - docker compose -f {{.CLUSTER_COMPOSE}} up -d
+      - 'printf "Waiting for cluster to bootstrap...\n"'
+      # The healthcheck condition gates on cluster_state:ok via the redis-cli
+      # CLUSTER INFO call inside the container — wait until it reports
+      # healthy. start_period inside the compose file gives the bootstrap
+      # script room before the first probe runs; this loop covers the rest.
+      - |
+        timeout=30
+        until [ "$(docker inspect -f '{{`{{.State.Health.Status}}`}}' mercure-redis-cluster 2>/dev/null)" = "healthy" ]; do
+          timeout=$((timeout - 1))
+          if [ $timeout -le 0 ]; then
+            echo "Cluster did not become healthy within 30s" >&2
+            docker compose -f {{.CLUSTER_COMPOSE}} logs --tail=50
+            exit 1
+          fi
+          sleep 1
+        done
+      - 'printf "\nRedis Cluster ready: 127.0.0.1:7000,7001,7002\n"'
+
+  cluster:down:
+    desc: Stop Redis Cluster and remove volumes
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.CLUSTER_COMPOSE}} down -v
+
+  cluster:logs:
+    desc: Follow Redis Cluster logs
+    deps: [_check:docker]
+    cmds:
+      - docker compose -f {{.CLUSTER_COMPOSE}} logs -f
+
+  # ============================================
+  # Conformance tests (Playwright) — hub-level acceptance against real Redis
+  # ============================================
+  conformance:install:
+    desc: Install Playwright + conformance deps (npm ci cached; browser install idempotent)
+    dir: ../conformance-tests
+    cmds:
+      - task: conformance:npmci
+      # Always run: the Playwright browser cache lives OUTSIDE node_modules
+      # (~/Library/Caches/ms-playwright), so npmci's checksum can't track it.
+      # Idempotent + a fast no-op when the browser is already installed.
+      - npx playwright install --with-deps chromium
+
+  conformance:npmci:
+    internal: true
+    dir: ../conformance-tests
+    # Reinstall node_modules only when the manifests change OR node_modules is
+    # missing: go-task checksums `sources` and re-runs when a `generates` path is
+    # absent — so a deleted node_modules self-heals. `.task/` is gitignored.
+    # Better than a `test -d node_modules` guard, which neither re-triggers on a
+    # package-lock bump nor notices a wiped/partial install.
+    sources:
+      - package.json
+      - package-lock.json
+    generates:
+      - node_modules/.package-lock.json
+    cmds:
+      - npm ci
+
+  conformance:selftest:
+    desc: Run the start/stop/wait helper's own test suite (after editing conformance-hub.sh)
+    cmds:
+      - /bin/sh {{.TASKFILE_DIR}}/scripts/conformance-hub_test.sh
+
+  conformance:run:
+    desc: Run Playwright conformance tests against a running hub
+    dir: ../conformance-tests
+    env:
+      BASE_URL: https://localhost/.well-known/mercure
+    cmds:
+      - npx playwright test --project=chromium
+
+  conformance:
+    desc: Full pipeline — Redis up → build → hub → Playwright → teardown (idempotent)
+    # Fail fast if another stack already holds the conformance ports. The hub
+    # binds :443/:80/:2019 natively; another local stack may publish the same
+    # ports via Docker, so running both silently tests the WRONG hub (the start
+    # helper backgrounds a hub that immediately dies on "address already in use").
+    # The first precondition makes lsof's own absence a loud failure, so a
+    # missing lsof can't turn the port guards into silent no-ops (`! lsof` would
+    # otherwise pass when lsof exits 127).
+    preconditions:
+      - sh: 'command -v lsof >/dev/null 2>&1'
+        msg: "lsof is required for the conformance port-collision guard (macOS ships it; Debian/Ubuntu: apt-get install lsof)."
+      - sh: 'command -v curl >/dev/null 2>&1'
+        msg: "curl is required for the conformance readiness gate (macOS ships it; Debian/Ubuntu: apt-get install curl)."
+      - sh: '! lsof -nP -iTCP:80 -sTCP:LISTEN >/dev/null 2>&1'
+        msg: ":80 is in use — stop any other local stack holding it first."
+      - sh: '! lsof -nP -iTCP:443 -sTCP:LISTEN >/dev/null 2>&1'
+        msg: ":443 is in use — stop any other local stack holding it first."
+      - sh: '! lsof -nP -iTCP:2019 -sTCP:LISTEN >/dev/null 2>&1'
+        msg: ":2019 (Caddy admin) is in use — stop any other local stack holding it first."
+    # The helper's own test suite is `task rt:conformance:selftest`, NOT a step
+    # here: it spawns processes + curls (network-dependent) and must never be
+    # able to hang the heavy build+Playwright pipeline.
+    cmds:
+      - task: redis:up
+      - defer: {task: redis:down}
+      # Teardown via the helper (real /bin/sh — see conformance-hub.sh for the
+      # go-task `$!`="g1" rationale). stop kills by pidfile, scoped pkill fallback.
+      # NB: the deferred-command form is a bare string; `defer: {cmd: ...}` is
+      # silently ignored by go-task (only `defer: {task: ...}` takes a mapping).
+      - defer: '{{.TASKFILE_DIR}}/scripts/conformance-hub.sh stop {{.CONFORMANCE_HUB_PID}} "mercure run -c .*conformance"'
+      - task: conformance:install
+      - task: build:binary
+      - 'printf "\nStarting hub in background (output -> /tmp/rt-conformance-hub.log)...\n"'
+      - '{{.TASKFILE_DIR}}/scripts/conformance-hub.sh start {{.CADDY_DIR}} {{.CONFORMANCE_HUB_PID}} ./mercure run -c ../../redistransport/{{.CONFORMANCE_CADDYFILE}}'
+      # Readiness gate (not a blind sleep): poll until the hub answers 400 to a
+      # bare GET (see conformance-hub.sh). The pidfile lets wait fail fast if the
+      # backgrounded hub dies, instead of polling a corpse or the wrong hub.
+      - '{{.TASKFILE_DIR}}/scripts/conformance-hub.sh wait https://localhost/.well-known/mercure 400 30 {{.CONFORMANCE_HUB_PID}}'
+      - task: conformance:run
+
+
+  # ============================================
+  # Module maintenance
+  # ============================================
+  # Namespaced under `mod:` to distinguish Go-module operations from the
+  # root Taskfile's tier-2 `task verify` (which composes ci + govulncheck
+  # + race-stress). Invocations: `task rt:mod:tidy`, `task rt:mod:verify`.
+  mod:tidy:
+    desc: go mod tidy — both modules
+    cmds:
+      - go mod tidy
+      - cd caddy && go mod tidy
+
+  mod:verify:
+    desc: go mod verify — both modules
+    cmds:
+      - go mod verify
+      - cd caddy && go mod verify
+
+  # ============================================
+  # Cleanup
+  # ============================================
+  clean:
+    desc: Remove local dev artifacts (coverage, pprof, bench binary, built mercure, cluster certs)
+    cmds:
+      - rm -f coverage.out coverage.html
+      - rm -rf profiles
+      - rm -f caddy/coverage.out caddy/coverage.html
+      - rm -f "{{.CADDY_DIR}}/mercure"
+      - rm -rf .tmp
+      - 'printf "Cleaned local dev artifacts\n"'
+
+  clean:all:
+    desc: clean + wipe go test/build caches (for debugging flaky caches)
+    cmds:
+      - task: clean
+      - go clean -testcache -cache
+      - cd caddy && go clean -testcache -cache
+      - 'printf "Cleaned local dev artifacts and go caches\n"'
+
+  # ============================================
+  # CI pipeline — non-mutating: fmt-check, lint, vet, test, build
+  # ============================================
+  ci:
+    desc: Non-mutating CI (fmt:check + lint:all + vet:all + test:all + build:all)
+    cmds:
+      - task: fmt:check
+      - task: lint:all
+      - task: vet:all
+      - task: test:all
+      - task: build:all
+      - 'printf "\nAll CI checks passed\n"'

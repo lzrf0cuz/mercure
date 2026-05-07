@@ -1,14 +1,35 @@
 package mercure
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 
 	"github.com/gorilla/mux"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// ErrTransportDoesNotSupportSubscribers signals that initSubscription was
+// invoked with a transport that doesn't implement TransportSubscribers.
+// registerSubscriptionHandlers (handler.go) is the only mechanism that
+// prevents this branch from being reached when the transport lacks the
+// interface — it skips route registration entirely in that case. Reaching
+// the 500-return below means that gate has regressed.
+//
+// Exported so operators with errors.Is-aware log/alert middleware can
+// branch on the failure mode without substring-matching the log message.
+var ErrTransportDoesNotSupportSubscribers = errors.New("transport does not implement TransportSubscribers")
+
+// ErrTooManySubscribers signals that the cluster's subscriber list exceeds the
+// transport's configured materialization cap, so GetSubscribers refused rather
+// than build a response large enough to OOM the hub. The SubscriptionsHandler
+// maps it to 503. Exported so the transport can return it (via errors.Is) and
+// operators can branch on it.
+var ErrTooManySubscribers = errors.New("too many subscribers to list")
 
 const (
 	jsonldContext            = "https://mercure.rocks/"
@@ -120,12 +141,31 @@ func (h *Hub) SubscriptionHandler(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+// writeGetSubscribersError writes the HTTP error, log, and span for a failed
+// GetSubscribers. A fleet exceeding the transport's materialization cap
+// (ErrTooManySubscribers) is a 503 — the endpoint can't serve a list that large
+// right now — rather than a 500.
+func (h *Hub) writeGetSubscribersError(ctx context.Context, w http.ResponseWriter, span trace.Span, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, ErrTooManySubscribers) {
+		status = http.StatusServiceUnavailable
+	}
+
+	http.Error(w, http.StatusText(status), status)
+
+	if h.logger.Enabled(ctx, slog.LevelError) {
+		h.logger.LogAttrs(ctx, slog.LevelError, "Error retrieving subscribers", slog.Any("error", err))
+	}
+
+	recordSpanError(span, err)
+}
+
 func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span trace.Span, currentURL, lastEventID string, subscribers []*Subscriber, ok bool) {
 	ctx, span := startSpan(r.Context(), "mercure.subscriptions", trace.WithSpanKind(trace.SpanKindInternal))
 	currentURL = r.URL.RequestURI()
 
 	if h.subscriberJWTKeyFunc != nil {
-		claims, err := h.authorize(r, false)
+		claims, err := h.authorizeAndBind(r, false)
 		if err != nil || claims == nil || claims.Mercure.Subscribe == nil || !canReceive(h.topicSelectorStore, []string{currentURL}, claims.Mercure.Subscribe) {
 			h.httpAuthorizationError(w, r, err)
 
@@ -139,26 +179,47 @@ func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span tra
 
 	transport, ok := h.transport.(TransportSubscribers)
 	if !ok {
-		panic("The transport isn't an instance of hub.TransportSubscribers")
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError,
+				"Subscription handler invoked but transport does not implement TransportSubscribers (registerSubscriptionHandlers should have prevented this)",
+				slog.Any("error", ErrTransportDoesNotSupportSubscribers))
+		}
+
+		// Tag the failure mode as a queryable span attribute so trace
+		// consumers can filter without substring-matching the recorded
+		// error message text. `error.type` is the OTel-standard attribute
+		// name for error categorization.
+		span.SetAttributes(attribute.String("error.type", "transport_does_not_support_subscribers"))
+		recordSpanError(span, ErrTransportDoesNotSupportSubscribers)
+
+		// Return empty currentURL (rather than the parsed RequestURI) for
+		// shape-consistency with the other failure paths in this function —
+		// neither caller reads currentURL when ok=false, but unconditional
+		// "" makes the contract uniform.
+		return span, "", "", nil, false
 	}
 
 	var err error
 
 	lastEventID, subscribers, err = transport.GetSubscribers(ctx)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-		if h.logger.Enabled(ctx, slog.LevelError) {
-			h.logger.LogAttrs(ctx, slog.LevelError, "Error retrieving subscribers", slog.Any("error", err))
-		}
-
-		recordSpanError(span, err)
+		h.writeGetSubscribersError(ctx, w, span, err)
 
 		return span, currentURL, lastEventID, subscribers, false
 	}
 
 	if r.Header.Get("If-None-Match") == lastEventID {
 		w.WriteHeader(http.StatusNotModified)
+
+		// Per OpenTelemetry HTTP server semantic conventions, spans for
+		// 1xx/2xx/3xx (and 4xx, which is client-side error) MUST stay at
+		// the default Unset status; only 5xx server-side errors set Error.
+		// The attribute below carries the distinguishing signal — a trace
+		// query filtering on mercure.subscriptions.cache_hit=true
+		// isolates etag-served requests without violating spec semantics.
+		span.SetAttributes(attribute.Bool("mercure.subscriptions.cache_hit", true))
 
 		return span, "", "", nil, false
 	}

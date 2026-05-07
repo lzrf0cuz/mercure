@@ -1,0 +1,123 @@
+# Caddyfile for transport-only testing of the Redis transport.
+#
+# This file is the testing scaffold used by `task go:run:redis` (from
+# the repo root) for in-package smoke + by the conformance suite via
+# `redistransport/integration_real_test.go`. It deliberately omits the
+# debug UI, cors, demo, and other operator-facing surface — for the
+# full operator dev loop (UI + demo + redis backend) use `task dev:redis`
+# at the repo root instead.
+#
+# Operator-facing knobs are env-overridable. Site addresses and non-secret
+# tunables use Caddy's `{$VAR:default}` parse-time syntax for standalone
+# operation; JWT directives use `{env.VAR}` runtime placeholders so RS256
+# PEM values pass through cleanly. Pair with `<root>/.env.dev` for the
+# HS256 dev defaults.
+#
+# Common overrides (all optional):
+#   SERVER_NAME=localhost:8443        task go:run:redis    # different port
+#     (the default is localhost:4000; :3000 is unavailable when the metrics
+#     profile of compose.observability.yaml is up, as Grafana binds it)
+#   METRICS_ADDR=:9092                task go:run:redis    # avoid clash with compose
+#   MERCURE_HUB_NAME=hub-a            task go:run:redis    # different hub label
+#   REDIS_URL=rediss://prod:6380      task go:run:redis    # different Redis
+#   REDIS_STREAM=mercure-test         task go:run:redis    # isolate streams
+#   MERCURE_REDIS_EXTRAS="cors_origins https://app.local" task go:run:redis
+#
+# Usage:
+#   task go:run:redis
+#   # or manually:
+#   cd caddy/mercure && go run -tags="nobadger,nomysql,nopgx" . run -c ../../redistransport/redis-test.Caddyfile
+#
+# Requires a running Redis instance at the URL configured below (default
+# redis://localhost:6379):
+#   docker run -d -p 6379:6379 redis:7-alpine
+#   # or:
+#   task rt:redis:up
+#
+# Health endpoints (Caddy admin API at localhost:2019, never published):
+#   http://localhost:2019/mercure/health/ready
+#   http://localhost:2019/mercure/health/live
+#   http://localhost:2019/mercure/health/{$MERCURE_HUB_NAME}/{ready,live}
+#
+# Prometheus metrics (default :9091; override with METRICS_ADDR):
+#   http://localhost:9091/metrics
+# The redis transport's series carry `transport_type="redis"` and live
+# alongside Caddy's stock `caddy_*` metrics. Caddy's admin API also
+# serves /metrics at :2019 — we expose a dedicated :9091 so the scrape
+# URL stays stable when admin is turned off in production.
+{
+	skip_install_trust
+
+	# Clean shutdown: cap drain at 10s. Without this, Caddy waits indefinitely
+	# for in-flight SSE connections to close, which makes test teardown / Ctrl+C
+	# cycles drag on. Matches the hub's local.Caddyfile posture.
+	grace_period 10s
+
+	{$GLOBAL_OPTIONS}
+}
+
+# Prometheus metrics endpoint — internal-only by convention. Bind to
+# `:9091` (default) or override via METRICS_ADDR for parallel runs that
+# would otherwise collide with `task up:build` (compose stack publishes
+# the container's :9091 to the same host port).
+{$METRICS_ADDR::9091} {
+	handle /metrics {
+		metrics
+	}
+	handle {
+		respond 404
+	}
+}
+
+{$CADDY_EXTRA_CONFIG}
+
+{$SERVER_NAME:localhost:4000} {
+	log
+
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API).
+	# Static UI assets at /.well-known/mercure/ui/* are still compressed.
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
+
+	mercure {
+		# Human-readable hub identifier used in per-hub health endpoints
+		# and metrics labels: /mercure/health/{$MERCURE_HUB_NAME}/{ready,live}.
+		name {$MERCURE_HUB_NAME:redis-dev}
+
+		anonymous
+		subscriptions
+
+		# JWT directives use {env.VAR} runtime placeholders so multiline PEM
+		# values (RS256 keys) survive intact — parse-time {$VAR} mangles
+		# newlines. .env.dev provides the HS256 dev defaults.
+		publisher_jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+		subscriber_jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+
+		# Redis transport — every knob is env-overridable.
+		transport redis {
+			url {$REDIS_URL:redis://localhost:6379}
+			stream {$REDIS_STREAM:mercure}
+			max_length {$REDIS_MAX_LENGTH:10000}
+			encoding {$REDIS_ENCODING:json}
+			event_ttl {$REDIS_EVENT_TTL:24h}
+			cleanup_interval {$REDIS_CLEANUP_INTERVAL:5m}
+		}
+
+		# Extra mercure directives (e.g. cors_origins, publish_origins).
+		# Namespaced to avoid colliding with `<root>/.env.dev`'s
+		# MERCURE_EXTRA_DIRECTIVES, which can contain a `transport bolt`
+		# block that would silently override the redis transport above.
+		{$MERCURE_REDIS_EXTRAS}
+	}
+
+	{$CADDY_SERVER_EXTRA_DIRECTIVES}
+
+	# Skip logging for browser-noise paths so the dev console stays readable.
+	log_skip /robots.txt
+	log_skip /favicon.ico
+
+	redir / /.well-known/mercure/ui/
+	respond "Mercure hub with Redis transport" 404
+}

@@ -141,7 +141,7 @@ func InitConfig(v *viper.Viper) {
 // NewHubFromViper creates a new Hub from the Viper config.
 //
 // Deprecated: use the Caddy server module or the standalone library instead.
-func NewHubFromViper(v *viper.Viper) (*Hub, error) { //nolint:funlen,gocognit
+func NewHubFromViper(v *viper.Viper) (*Hub, error) {
 	if err := ValidateConfig(v); err != nil {
 		log.Panic(err)
 	}

@@ -12,11 +12,11 @@ import (
 
 var (
 	// Deprecated: directly instantiate the transport or use transports Caddy modules.
-	transportFactories   = make(map[string]TransportFactory) //nolint:gochecknoglobals
-	transportFactoriesMu sync.RWMutex                        //nolint:gochecknoglobals
+	transportFactories   = make(map[string]TransportFactory)
+	transportFactoriesMu sync.RWMutex
 )
 
-func init() { //nolint:gochecknoinits
+func init() {
 	//mercure:deadlock
 	RegisterTransportFactory("bolt", DeprecatedNewBoltTransport)
 	RegisterTransportFactory("local", DeprecatedNewLocalTransport)
@@ -26,7 +26,7 @@ func init() { //nolint:gochecknoinits
 type TransportFactory = func(u *url.URL, l *slog.Logger) (Transport, error)
 
 // Deprecated: directly instantiate the transport or use transports Caddy modules.
-func NewTransport(u *url.URL, l *slog.Logger) (Transport, error) { //nolint:ireturn
+func NewTransport(u *url.URL, l *slog.Logger) (Transport, error) {
 	transportFactoriesMu.RLock()
 
 	f, ok := transportFactories[u.Scheme]
@@ -52,7 +52,7 @@ func RegisterTransportFactory(scheme string, factory TransportFactory) {
 // DeprecatedNewBoltTransport creates a new BoltTransport.
 //
 // Deprecated: use NewBoltTransport() instead.
-func DeprecatedNewBoltTransport(u *url.URL, l *slog.Logger) (Transport, error) { //nolint:ireturn
+func DeprecatedNewBoltTransport(u *url.URL, l *slog.Logger) (Transport, error) {
 	var err error
 
 	q := u.Query()
@@ -96,6 +96,6 @@ func DeprecatedNewBoltTransport(u *url.URL, l *slog.Logger) (Transport, error) {
 // DeprecatedNewLocalTransport creates a new LocalTransport.
 //
 // Deprecated: use NewLocalTransport() instead.
-func DeprecatedNewLocalTransport(_ *url.URL, _ *slog.Logger) (Transport, error) { //nolint:ireturn
+func DeprecatedNewLocalTransport(_ *url.URL, _ *slog.Logger) (Transport, error) {
 	return NewLocalTransport(NewSubscriberList(DefaultSubscriberListCacheSize)), nil
 }

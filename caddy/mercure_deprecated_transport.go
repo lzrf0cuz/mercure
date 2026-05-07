@@ -13,10 +13,9 @@ import (
 )
 
 // Deprecated: use transports Caddy modules.
-var transports = caddy.NewUsagePool() //nolint:gochecknoglobals
-// Deprecated
-//
-//nolint:wrapcheck,ireturn,nilnil
+var transports = caddy.NewUsagePool()
+
+// Deprecated: use transports Caddy modules.
 func (m *Mercure) createTransportDeprecated() (mercure.Transport, error) {
 	if m.TransportURL == "" {
 		return nil, nil
@@ -75,7 +74,6 @@ func (m *Mercure) assignDeprecatedTransportURLForEnv() {
 	m.TransportURL = os.Getenv("MERCURE_TRANSPORT_URL")
 }
 
-//nolint:wrapcheck
 func (m *Mercure) cleanupTransportDeprecated() error {
 	if m.TransportURL == "" {
 		return nil

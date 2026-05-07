@@ -1,0 +1,119 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Distributed traces for the Redis Streams transport, from the Jaeger sidecar that `task dev:full:tracing` brings up. The Jaeger datasource only resolves while that profile is running; in the default metrics-only loop this dashboard shows no data (open the metrics dashboard 'Mercure Redis Transport' instead). The full trace explorer with the timeline/flamegraph view is the Jaeger UI at http://localhost:16686.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [
+    {
+      "title": "Jaeger UI (full trace explorer)",
+      "type": "link",
+      "icon": "external link",
+      "url": "http://localhost:16686",
+      "targetBlank": true,
+      "tags": []
+    },
+    {
+      "title": "Transport metrics dashboard",
+      "type": "link",
+      "icon": "dashboard",
+      "url": "/d/mercure-redis-transport/mercure-redis-transport",
+      "targetBlank": false,
+      "tags": []
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "About these traces",
+      "type": "text",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Traces are emitted by the hub only when tracing is enabled (`task dev:full:tracing`, which sets the Caddy `tracing` directive + points OTLP at the Jaeger sidecar). Spans: **`mercure.publish`**, **`mercure.subscribe`**, and the transport's **`mercure.transport.history`** (carrying `mercure.history.events_replayed` / `.future_dated` / `.full_scan` / `.truncated`). Click a row below to open the trace, or use the **Jaeger UI** link (top-right) for the full timeline/flamegraph and tag search."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Recent mercure-hub traces",
+      "type": "table",
+      "datasource": {
+        "type": "jaeger",
+        "uid": "jaeger"
+      },
+      "description": "Trace search against the Jaeger datasource (service = mercure-hub). Each row links to the full trace. No data unless `task dev:full:tracing` is running.",
+      "gridPos": {
+        "h": 18,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "jaeger",
+            "uid": "jaeger"
+          },
+          "queryType": "search",
+          "service": "mercure-hub",
+          "limit": 50,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "mercure",
+    "redistransport",
+    "redis",
+    "tracing"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Mercure Redis Transport — Tracing",
+  "uid": "mercure-redis-transport-tracing",
+  "version": 1,
+  "weekStart": ""
+}

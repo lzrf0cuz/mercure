@@ -20,6 +20,10 @@ func startSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) 
 }
 
 // recordSpanError marks the span as errored.
+//
+// Fork note: redistransport/tracer.go carries a behavior-compatible copy
+// (the rt module can't import this unexported helper). Keep the two in sync
+// if the error-recording semantics change here.
 func recordSpanError(span trace.Span, err error) {
 	span.RecordError(err)
 	span.SetStatus(codes.Error, err.Error())

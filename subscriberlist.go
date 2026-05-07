@@ -38,16 +38,18 @@ func NewSubscriberList(cacheSize int) *SubscriberList {
 }
 
 func encode(topics []string, private bool) string {
-	sort.Strings(topics)
+	sorted := make([]string, len(topics))
+	copy(sorted, topics)
+	sort.Strings(sorted)
 
-	parts := make([]string, len(topics)+1)
+	parts := make([]string, len(sorted)+1)
 	if private {
 		parts[0] = "1"
 	} else {
 		parts[0] = "0"
 	}
 
-	for i, t := range topics {
+	for i, t := range sorted {
 		parts[i+1] = replacer.Replace(t)
 	}
 

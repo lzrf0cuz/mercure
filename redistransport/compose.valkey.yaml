@@ -1,0 +1,72 @@
+# Docker Compose — Valkey + RedisInsight for local development
+#
+# Valkey is a Redis-compatible fork (https://valkey.io).
+# Our transport works with both Redis and Valkey — they use the same wire protocol.
+#
+# Includes the shared RedisInsight UI stack (compose.redisinsight.yaml) so
+# both backends offer the same dev experience.
+#
+# Usage:
+#   docker compose -f redistransport/compose.valkey.yaml up -d
+#
+# Services:
+#   valkey         — Valkey 8 server on localhost:6379
+#   redisinsight   — Web UI on http://localhost:5540 (from compose.redisinsight.yaml)
+#
+# RedisInsight auto-trusts localhost via RITRUSTEDORIGINS and the
+# redisinsight-bootstrap sidecar registers the Valkey connection
+# automatically (see compose.redisinsight.yaml). Open http://localhost:5540
+# and the "Local Valkey" connection is already wired.
+#
+# To use with the Mercure hub:
+#   # Option 1: Standalone Caddyfile (no env vars needed)
+#   cd caddy/mercure && go run -tags="nobadger,nomysql,nopgx" . run -c ../../redistransport/redis-test.Caddyfile
+#
+#   # Option 2: Via .env.dev + local.Caddyfile
+#   # Edit .env.dev: swap the transport block to redis (see comments in .env.dev)
+#   cd caddy/mercure && go run -tags="nobadger,nomysql,nopgx" . run --environ -c ../../local.Caddyfile
+
+include:
+  - compose.redisinsight.yaml
+  - compose.observability.yaml
+
+name: mercure-valkey
+
+services:
+  valkey:
+    container_name: mercure-valkey
+    image: ${VALKEY_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - valkey_data:/data
+
+  # Override the redisinsight service from compose.redisinsight.yaml to
+  # add a backend dependency — UI starts only after valkey is healthy.
+  redisinsight:
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  # Override the bootstrap sidecar to point at this stack's backend.
+  # depends_on: redisinsight is inherited from compose.redisinsight.yaml.
+  redisinsight-bootstrap:
+    environment:
+      BACKEND_HOST: valkey
+      BACKEND_NAME: Local Valkey
+
+volumes:
+  valkey_data:

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -23,6 +24,10 @@ const (
 
 // ErrUnsupportedProtocolVersion is returned when the version passed is unsupported.
 var ErrUnsupportedProtocolVersion = errors.New("compatibility mode only supports protocol version 7")
+
+// ErrInvalidSubscriberOutBuffer is returned by WithSubscriberOutBuffer for a
+// positive value below MinSubscriberOutBuffer.
+var ErrInvalidSubscriberOutBuffer = errors.New("subscriber out buffer must be 0 (use the default) or at least the minimum")
 
 // Option instances allow to configure the library.
 type Option func(o *opt) error
@@ -108,10 +113,44 @@ func WithDispatchTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithPublishTimeout bounds a single detached publish, disabled by default (0).
+// The publish path detaches dispatch from the publisher's request context so a
+// mid-publish disconnect does not abort the write; without a bound, a stalled
+// transport (e.g. an unresponsive Redis) would block that goroutine
+// indefinitely. The deadline covers the whole detached call — the transport
+// dispatch including any publisher rate-limit wait. When it is exceeded the
+// write may still have committed, so PublishHandler returns 504 — a retry is
+// safe only for idempotent updates (a stable, publisher-supplied id).
+func WithPublishTimeout(timeout time.Duration) Option {
+	return func(o *opt) error {
+		o.publishTimeout = timeout
+
+		return nil
+	}
+}
+
 // WithHeartbeat sets the frequency of the heartbeat, disabled by default.
 func WithHeartbeat(interval time.Duration) Option {
 	return func(o *opt) error {
 		o.heartbeat = interval
+
+		return nil
+	}
+}
+
+// WithSubscriberOutBuffer sets the per-subscriber out-channel and pre-ready
+// queue capacity (default 1000). Each connected subscriber commits this many
+// *Update slots up front, so a large fleet may want it lower to cut steady-state
+// memory and cold-start allocation pressure. 0 keeps the default; a positive
+// value below MinSubscriberOutBuffer is rejected (a buffer that small sheds live
+// updates), so a too-small setting fails loudly rather than silently reverting.
+func WithSubscriberOutBuffer(size int) Option {
+	return func(o *opt) error {
+		if size != 0 && size < MinSubscriberOutBuffer {
+			return fmt.Errorf("%w %d, got %d", ErrInvalidSubscriberOutBuffer, MinSubscriberOutBuffer, size)
+		}
+
+		o.subscriberOutBuffer = size
 
 		return nil
 	}
@@ -164,10 +203,16 @@ func WithAllowedHosts(hosts []string) Option {
 	}
 }
 
+// nullOrigin is the literal "null" the spec mandates for sandboxed
+// browsing contexts (data:, file://, srcdoc, opaque). Allow-listed
+// alongside "*" by validateOrigins, which is the shared validator for
+// WithPublishOrigins and WithCORSOrigins.
+const nullOrigin = "null"
+
 func validateOrigins(origins []string) error {
 	for _, origin := range origins {
 		switch origin {
-		case "*", "null": //nolint:goconst
+		case "*", nullOrigin:
 			continue
 		}
 
@@ -274,12 +319,24 @@ func WithProtocolVersionCompatibility(protocolVersionCompatibility int) Option {
 	}
 }
 
+// WithCodec sets the Codec used for serializing updates in transports.
+// Defaults to JSONCodec if not set. Transports that implement TransportCodec
+// will receive this codec automatically.
+func WithCodec(c Codec) Option {
+	return func(o *opt) error {
+		o.codec = c
+
+		return nil
+	}
+}
+
 // opt contains the available options.
 //
 // If you change this, also update the Caddy module and the documentation.
 type opt struct {
 	transport                    Transport
 	topicSelectorStore           *TopicSelectorStore
+	codec                        Codec
 	anonymous                    bool
 	debug                        bool
 	subscriptions                bool
@@ -299,6 +356,9 @@ type opt struct {
 	corsOrigins                  []string
 	cookieName                   string
 	protocolVersionCompatibility int
+	subscriberOutBuffer          int
+	publishTimeout               time.Duration
+	claimHeaderBindings          []ClaimHeaderBinding
 }
 
 func (o *opt) isBackwardCompatiblyEnabledWith(version int) bool {
@@ -312,6 +372,16 @@ type Hub struct {
 
 	handler http.Handler
 	ctx     context.Context //nolint:containedctx
+
+	// demoInsecureWarned bounds the Demo handler's non-Secure-cookie warning
+	// to once per hub instance (per process in the common single-hub case) via a CAS. The Demo endpoint is unauthenticated, so
+	// without this an attacker hitting it over plain HTTP from a non-loopback
+	// address could amplify the Warn into a log-volume DoS. The warning
+	// signals a static misconfiguration (trusted_proxies / X-Forwarded-Proto),
+	// so once is enough for an operator to act on. (atomic.Bool rather than
+	// sync.Once so the log call stays in the handler scope with the request
+	// context in view — sync.Once.Do's func() signature can't thread ctx.)
+	demoInsecureWarned atomic.Bool
 }
 
 // NewHub creates a new Hub instance.
@@ -349,12 +419,26 @@ func NewHub(ctx context.Context, options ...Option) (*Hub, error) {
 		ttss.SetTopicSelectorStore(opt.topicSelectorStore)
 	}
 
+	if opt.codec != nil {
+		if tc, ok := opt.transport.(TransportCodec); ok {
+			tc.SetCodec(opt.codec)
+		}
+	}
+
 	if opt.metrics == nil {
 		opt.metrics = NopMetrics{}
 	}
 
 	if opt.cookieName == "" {
 		opt.cookieName = defaultCookieName
+	}
+
+	// Set-level validation of claim-header bindings: the Hub is the only place that sees
+	// every binding, and it must guard programmatic callers too, not just the Caddy
+	// adapter. Runs after the logger default (it may warn) and before initHandler (which
+	// consumes the binding header names for CORS).
+	if err := opt.validateClaimHeaderBindings(); err != nil {
+		return nil, err
 	}
 
 	h := &Hub{opt: opt, ctx: ctx}
