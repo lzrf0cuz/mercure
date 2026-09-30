@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,6 +52,24 @@ var (
 	unnamedHubs = make(map[*caddyhttp.App]*Mercure) //nolint:gochecknoglobals
 	hubsMu      sync.Mutex                          //nolint:gochecknoglobals
 )
+
+// exitState is the state shared by the stop handling; hubsMu guards it.
+var exitState = struct { //nolint:gochecknoglobals
+	// exitedAt is the exit signal: the time the first hub saw Caddy's
+	// "stopping" event for the process exit; zero until then.
+	exitedAt time.Time
+
+	// retiredHubs maps each module replaced by a config reload while it has
+	// requests in flight to a channel closed once they have all ended.
+	retiredHubs map[*Mercure]chan struct{}
+
+	// exitWaitApps holds the HTTP apps that already have waitForRetiredHubs
+	// registered as a stop hook.
+	exitWaitApps map[*caddyhttp.App]struct{}
+}{
+	retiredHubs:  make(map[*Mercure]chan struct{}),
+	exitWaitApps: make(map[*caddyhttp.App]struct{}),
+}
 
 type hubInfo struct {
 	hub       *mercure.Hub
@@ -155,6 +175,13 @@ type Mercure struct {
 	// Frequency of the heartbeat, defaults to 40s.
 	Heartbeat *caddy.Duration `json:"heartbeat,omitempty"`
 
+	// Maximum duration of a single dispatch, disabled by default. Dispatch runs
+	// detached from the publisher's request. Bolt and Local ignore it; the Redis
+	// transport checks it between commands (rate limit, pool wait, retries) and
+	// also cuts a command already sent to the server. On timeout the publisher
+	// gets a 504, but the update may already be stored.
+	PublishTimeout *caddy.Duration `json:"publish_timeout,omitempty"`
+
 	// Maximum size in bytes of publish and QUERY subscribe request bodies;
 	// larger requests are rejected with a 413 status code. Defaults to 1MiB,
 	// set to 0 to disable the in-hub limit.
@@ -183,17 +210,40 @@ type Mercure struct {
 	// implicit issuer (usable only in compatibility mode).
 	SubscriberJWKSURL string `json:"subscriber_jwks_url,omitempty"`
 
+	// Bindings requiring a JWT claim to agree with an HTTP header, e.g. the "groups"
+	// claim with the "Group-ID" header. Every applicable binding must hold: a missing,
+	// empty or repeated bound header is answered with a 400, a bound claim of unusable type
+	// with a 401, and an absent or mismatched claim with a 403 (on_missing allow skips a
+	// genuinely absent header or claim).
+	ClaimHeaderBindings []ClaimHeaderBindingConfig `json:"require_claim_headers,omitempty"`
+
+	// Bindings requiring a JWT claim to hold at least one of a fixed set of values, e.g.
+	// the "groups" claim with "red" and "blue". Every applicable binding must hold:
+	// a bound claim of unusable type is answered with a 401, and an absent claim or one
+	// holding none of the values with a 403.
+	ClaimValueBindings []ClaimValueBindingConfig `json:"require_claim_values,omitempty"`
+
 	// Origins allowed to publish updates
 	PublishOrigins []string `json:"publish_origins,omitempty"`
 
 	// Allowed CORS origins.
 	CORSOrigins []string `json:"cors_origins,omitempty"`
 
+	// Request headers the CORS preflight allows in addition to Authorization,
+	// Cache-Control, Last-Event-ID and the headers claim bindings read. Needs cors_origins.
+	CORSAllowedHeaders []string `json:"cors_allowed_headers,omitempty"`
+
 	// Match cache budget in 100-byte units; nonpositive disables it.
 	// Defaults to DefaultTopicMatcherStoreCacheSize.
 	TopicMatcherCacheSize *int `json:"topic_matcher_cache_size,omitempty"`
 
 	SubscriberListCacheSize *int `json:"subscriber_list_cache_size,omitempty"`
+
+	// Per-subscriber out-channel capacity, which also bounds the pre-ready
+	// queue; defaults to 1000. Each connected subscriber commits this many
+	// update slots up front, so a large fleet may want it lower to cut memory.
+	// 0 keeps the default; a positive value below 16 is rejected.
+	SubscriberOutBuffer *int `json:"subscriber_out_buffer,omitempty"`
 
 	// The name of the authorization cookie. Defaults to
 	// "__Secure-mercure_access_token"; plain-HTTP deployments must configure a
@@ -219,10 +269,23 @@ type Mercure struct {
 	// The transport configuration.
 	TransportRaw json.RawMessage `json:"transport,omitempty" caddy:"namespace=http.handlers.mercure inline_key=name"` //nolint:tagalign
 
-	hub           *mercure.Hub
+	hub *mercure.Hub
+	// identityFn: see newIdentityFunc.
+	identityFn    func(context.Context, mercure.VerifiedIdentity)
 	logger        *slog.Logger
 	cancel        context.CancelFunc
 	unnamedHubApp *caddyhttp.App
+	httpApp       *caddyhttp.App
+
+	// requestsMu guards requests and retiring. Lock it before hubsMu.
+	requestsMu sync.Mutex
+	// requests is the number of ServeHTTP calls in flight.
+	requests int
+	// retiring is set when a config reload replaced m; see handleStopping.
+	retiring bool
+	// lastArrivalAfterExit is when the latest request reached m after the exit
+	// signal had fired, or zero. Guarded by hubsMu.
+	lastArrivalAfterExit time.Time
 }
 
 // CaddyModule returns the Caddy module information.
@@ -243,7 +306,9 @@ func (s stoppingHandlerFunc) Handle(_ context.Context, _ caddy.Event) error {
 
 //nolint:wrapcheck
 func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,gocognit,gocyclo,maintidx
-	metrics := mercure.NewPrometheusMetrics(ctx.GetMetricsRegistry())
+	// This config's registry, for the hub's metrics and for bindTransportMetrics.
+	metricsRegistry := ctx.GetMetricsRegistry()
+	metrics := mercure.NewPrometheusMetrics(metricsRegistry)
 
 	m.logger = slog.New(mercure.NewSlogHandler(ctx.Slogger().Handler()))
 
@@ -304,6 +369,10 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 		transport = mod.(Transport).GetTransport()
 	}
 
+	if err := bindTransportMetrics(transport, metricsRegistry, m.logger); err != nil {
+		return err
+	}
+
 	opts := []mercure.Option{
 		mercure.WithLogger(m.logger),
 		mercure.WithTopicMatcherStore(tms),
@@ -332,6 +401,23 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	if len(issuers) > 0 {
 		opts = append(opts, mercure.WithIssuers(issuers))
+	}
+
+	bindings, err := m.claimHeaderBindings()
+	if err != nil {
+		return err
+	}
+
+	valueBindings, err := m.claimValueBindings()
+	if err != nil {
+		return err
+	}
+
+	bindings = append(bindings, valueBindings...)
+	m.identityFn = newIdentityFunc(bindingPlaceholders(m))
+
+	if len(bindings) > 0 {
+		opts = append(opts, mercure.WithClaimHeaderBindings(bindings...))
 	}
 
 	if m.Anonymous {
@@ -376,6 +462,14 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 		opts = append(opts, mercure.WithSubscriptionLimits(*m.SubscriptionLimits))
 	}
 
+	if d := m.PublishTimeout; d != nil {
+		opts = append(opts, mercure.WithPublishTimeout(time.Duration(*d)))
+	}
+
+	if m.SubscriberOutBuffer != nil {
+		opts = append(opts, mercure.WithSubscriberOutBuffer(*m.SubscriberOutBuffer))
+	}
+
 	if s := m.MaxRequestBodySize; s != nil {
 		opts = append(opts, mercure.WithMaxRequestBodySize(*s))
 	}
@@ -386,6 +480,10 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	if len(m.CORSOrigins) > 0 {
 		opts = append(opts, mercure.WithCORSOrigins(m.CORSOrigins))
+	}
+
+	if len(m.CORSAllowedHeaders) > 0 {
+		opts = append(opts, mercure.WithCORSAllowedHeaders(m.CORSAllowedHeaders))
 	}
 
 	if m.ProtocolVersionCompatibility != 0 {
@@ -410,14 +508,12 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	// Cancel during the event: waiting for Cleanup would deadlock with the server shutdown.
 	if err := eventApp.(*caddyevents.App).On("stopping", stoppingHandlerFunc(func() {
-		if shouldDrainOnStopping(caddy.Exiting(), m.DrainTimeout) {
-			h.Drain()
-
-			return
-		}
-
-		m.cancel()
+		m.handleStopping(caddy.Exiting())
 	})); err != nil {
+		return err
+	}
+
+	if err := m.registerExitWait(ctx); err != nil {
 		return err
 	}
 
@@ -459,6 +555,8 @@ func (m *Mercure) Cleanup() error {
 	if unnamedHubs[m.unnamedHubApp] == m {
 		delete(unnamedHubs, m.unnamedHubApp)
 	}
+
+	delete(exitState.exitWaitApps, m.httpApp)
 
 	for k, info := range hubs {
 		if info.hub == m.hub {
@@ -504,13 +602,67 @@ func (m *Mercure) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		scheme, host = forwardedOrigin(r.Header, scheme, host)
 	}
 
+	m.requestStarted()
+	defer m.requestEnded()
+
 	// Pass the origin out-of-band via the context, never by mutating r.URL: the
 	// playground handler builds its rel="self" Link from r.URL.String(), which
 	// must stay a relative path. Writing scheme/host onto r.URL would corrupt
 	// that Link by turning it into an absolute URL.
-	m.hub.ServeHTTP(w, r.WithContext(mercure.NewRequestOriginContext(r.Context(), scheme, host)))
+	ctx := mercure.NewRequestOriginContext(r.Context(), scheme, host)
+	ctx = mercure.NewVerifiedIdentityContext(ctx, m.identityFn)
+
+	m.hub.ServeHTTP(w, r.WithContext(ctx))
 
 	return nil
+}
+
+const bindingPlaceholderPrefix = "http.mercure.binding."
+
+// bindingPlaceholders maps each bound claim to its placeholder name.
+func bindingPlaceholders(m *Mercure) map[string]string {
+	names := make(map[string]string, len(m.ClaimHeaderBindings)+len(m.ClaimValueBindings))
+
+	for _, c := range m.ClaimHeaderBindings {
+		names[c.Claim] = bindingPlaceholderPrefix + c.Claim
+	}
+
+	for _, c := range m.ClaimValueBindings {
+		names[c.Claim] = bindingPlaceholderPrefix + c.Claim
+	}
+
+	return names
+}
+
+// newIdentityFunc returns the callback that sets the verified identity as request
+// placeholders. The hub calls it only after verification and bindings, so the placeholders
+// stay unset otherwise. It overwrites an earlier {http.auth.user.id} when the token has a
+// sub, and never deletes one. For binding precedence, see docs/deployment/configuration.md.
+func newIdentityFunc(bindingNames map[string]string) func(context.Context, mercure.VerifiedIdentity) {
+	return func(ctx context.Context, id mercure.VerifiedIdentity) {
+		repl, ok := ctx.Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+		if !ok {
+			return
+		}
+
+		if id.Subject != "" {
+			repl.Set("http.auth.user.id", id.Subject)
+		}
+
+		if id.ClientID != "" {
+			repl.Set("http.auth.user.client_id", id.ClientID)
+		}
+
+		if id.JWTID != "" {
+			repl.Set("http.auth.user.jti", id.JWTID)
+		}
+
+		repl.Set("http.mercure.role", id.Role)
+
+		for _, b := range id.Bindings {
+			repl.Set(bindingNames[b.Claim], b.Value)
+		}
+	}
 }
 
 // forwardedOrigin overrides scheme and host with the X-Forwarded-Proto and
@@ -604,6 +756,11 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 
 				m.SubscriptionLimits = &mercure.SubscriptionLimits{Total: limits[0], PerToken: limits[1], PerClient: limits[2]}
 
+			case "publish_timeout":
+				if m.PublishTimeout, err = parseDurationParameter(d); err != nil {
+					return err
+				}
+
 			case "max_request_body_size":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -663,6 +820,12 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 					return d.ArgErr()
 				}
 
+			case "cors_allowed_headers":
+				m.CORSAllowedHeaders = d.RemainingArgs()
+				if len(m.CORSAllowedHeaders) == 0 {
+					return d.ArgErr()
+				}
+
 			case "transport":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -717,6 +880,22 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 
 				m.SubscriberListCacheSize = &size
 
+			case "subscriber_out_buffer":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				size, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.WrapErr(err)
+				}
+
+				if size != 0 && size < mercure.MinSubscriberOutBuffer {
+					return d.Errf("subscriber_out_buffer must be 0 (use the default) or at least %d, got %d", mercure.MinSubscriberOutBuffer, size)
+				}
+
+				m.SubscriberOutBuffer = &size
+
 			case "cookie_name":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -760,6 +939,29 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 				}
 
 				m.ProtocolVersionCompatibility = v
+
+			case requireClaimHeader:
+				cfg, err := parseRequireClaimHeader(d)
+				if err != nil {
+					return err
+				}
+
+				// NewHub rejects this too, but without a file:line.
+				if cfg.CountSubscribers && slices.ContainsFunc(m.ClaimHeaderBindings, func(c ClaimHeaderBindingConfig) bool { return c.CountSubscribers }) {
+					backToCountSubscribers(d)
+
+					return directiveErr(requireClaimHeader, d.Errf("option %q may be set on only one binding", countSubscribers))
+				}
+
+				m.ClaimHeaderBindings = append(m.ClaimHeaderBindings, cfg)
+
+			case requireClaimValue:
+				cfg, err := parseRequireClaimValue(d)
+				if err != nil {
+					return err
+				}
+
+				m.ClaimValueBindings = append(m.ClaimValueBindings, cfg)
 
 			default:
 				// Fail loudly: silently ignoring a typo would disable whatever
@@ -1224,6 +1426,8 @@ func (m *Mercure) playgroundTokenFunc() func(string) (string, error) {
 
 var (
 	errInvalidJWKSetFileHost = errors.New(`file:// JWK Set URL host must be empty or "localhost"`)
+	errRelativeJWKSetFile    = errors.New("file: JWK Set URL must name an absolute path")
+	errEmptyJWKSet           = errors.New("the JWK Set holds no key that could be decoded")
 	errJWKSetRedirect        = errors.New("refusing to follow JWK Set redirect")
 )
 
@@ -1231,23 +1435,62 @@ func refuseJWKSetRedirect(req *http.Request, _ []*http.Request) error {
 	return fmt.Errorf("%w to %s: configure the final URL as jwks_uri", errJWKSetRedirect, req.URL.Redacted())
 }
 
-// newJWKSetKeyfunc builds a Keyfunc from a JWK Set URL.
+// jwksHTTPFetchTimeout bounds an HTTP(S) JWK Set's first fetch, made once per
+// verifier at config load, and each scheduled refresh, so a slow or
+// blackholing JWKS endpoint cannot hang the Caddy config load. The verifiers'
+// first fetches run one after another, so a config load can wait this long
+// for each of them. It does not bound an unknown-kid refetch (see
+// jwksOverride).
+const jwksHTTPFetchTimeout = 10 * time.Second
+
+// checkJWKSetFileURL accepts only file:///absolute/path, with the host empty
+// or "localhost".
+func checkJWKSetFileURL(u *url.URL, rawURL string) error {
+	if u.Host != "" && u.Host != "localhost" {
+		return fmt.Errorf("%w, got %q in %q; the supported form is file:///absolute/path", errInvalidJWKSetFileHost, u.Host, rawURL)
+	}
+
+	if !path.IsAbs(u.Path) {
+		return fmt.Errorf("%w, got %q; the supported form is file:///absolute/path", errRelativeJWKSetFile, rawURL)
+	}
+
+	return nil
+}
+
+// newJWKSetKeyfunc builds a Keyfunc from a JWK Set URL. Failed background
+// refreshes are logged through logger.
 //
 // file:// URLs point to a local JSON file containing a JWK Set; the file is
-// read once at provision time, so rotating the keys requires a Caddy config
-// reload. HTTP(S) resources are refreshed using a client that refuses redirects,
-// so a trusted JWK Set endpoint cannot redirect requests to other services.
+// read once at provision time, so rotating the keys requires a forced Caddy
+// config reload. Other URLs are forwarded to keyfunc.NewDefaultOverrideCtx
+// with jwksOverride, which handles HTTP(S) and rejects unsupported schemes.
+// HTTP(S) resources are fetched and refreshed using a client that refuses
+// redirects, so a trusted JWK Set endpoint cannot redirect requests to other
+// services.
+//
+// A hub whose key set is empty would start and then reject every token, so
+// that fails Provision instead: jwksOverride fails the first HTTP(S) fetch,
+// and checkJWKSetHasKeys rejects a set that decoded to no key (also for
+// file://, which is read only once). The failure conditions are listed in the
+// JWKS section of docs/deployment/configuration.md.
+//
+// Because the fetch runs during Provision, before any listener starts, a JWK
+// Set served by this same Caddy config cannot be loaded at startup, and caddy
+// validate needs network access to the URL.
+//
+// The errors returned here name the URL as configured (keyfunc's do), so a
+// JWK Set URL must not carry credentials.
 //
 //nolint:ireturn
 func newJWKSetKeyfunc(ctx context.Context, logger *slog.Logger, rawURL string) (keyfunc.Keyfunc, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JWK Set URL %q: %w", rawURL, err)
+		return nil, fmt.Errorf("invalid JWK Set URL: %w", err)
 	}
 
 	if u.Scheme == "file" {
-		if u.Host != "" && u.Host != "localhost" {
-			return nil, fmt.Errorf("%w, got %q", errInvalidJWKSetFileHost, u.Host)
+		if err := checkJWKSetFileURL(u, rawURL); err != nil {
+			return nil, err
 		}
 
 		b, err := os.ReadFile(u.Path)
@@ -1260,22 +1503,81 @@ func newJWKSetKeyfunc(ctx context.Context, logger *slog.Logger, rawURL string) (
 			return nil, fmt.Errorf("failed to parse JWK Set file %q: %w", u.Path, err)
 		}
 
+		if err := checkJWKSetHasKeys(ctx, k, u.Path); err != nil {
+			return nil, err
+		}
+
 		return k, nil
 	}
 
-	// Otherwise keyfunc logs to slog.Default(), hiding even the swallowed first-fetch error from Caddy's logs.
-	refreshErrorHandler := func(string) func(context.Context, error) {
-		return func(ctx context.Context, err error) {
-			if logger.Enabled(ctx, slog.LevelError) {
-				logger.LogAttrs(ctx, slog.LevelError, "Failed to fetch the JWK Set", slog.String("url", u.Redacted()), slog.Any("error", err))
-			}
-		}
+	// ctx outlives the call: keyfunc ends its refresh goroutine when ctx is
+	// done. HTTPTimeout, not ctx, bounds the first fetch.
+	k, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{rawURL}, jwksOverride(logger, u))
+	if err != nil {
+		// keyfunc's error names the URL.
+		return nil, fmt.Errorf("failed to load JWK Set: %w", err)
 	}
 
-	return keyfunc.NewDefaultOverrideCtx(ctx, []string{rawURL}, keyfunc.Override{ //nolint:wrapcheck
-		Client:                  &http.Client{CheckRedirect: refuseJWKSetRedirect},
-		RefreshErrorHandlerFunc: refreshErrorHandler,
-	})
+	// Nothing else names the URL here, so this error does.
+	if err := checkJWKSetHasKeys(ctx, k, rawURL); err != nil {
+		return nil, err
+	}
+
+	return k, nil
+}
+
+// checkJWKSetHasKeys fails when the loaded set holds no key jwkset could
+// decode. Such a set can still hold keys unable to verify a token (e.g. only
+// X25519 keys, or only oct keys under the asymmetric allowlist); this check
+// does not look at that. Over HTTP, jwkset replaces the store with whatever
+// the answer decoded to and skips keys of an unsupported type, so a
+// well-formed answer can leave it empty. A file:// set containing any
+// unsupported key is rejected as a whole by keyfunc.NewJWKSetJSON instead.
+func checkJWKSetHasKeys(ctx context.Context, k keyfunc.Keyfunc, source string) error {
+	keys, err := k.Storage().KeyReadAll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read JWK Set from %q: %w", source, err)
+	}
+
+	if len(keys) == 0 {
+		return fmt.Errorf("%w: %q", errEmptyJWKSet, source)
+	}
+
+	return nil
+}
+
+// jwksOverride returns the keyfunc settings for the HTTP(S) JWK Set at u: a
+// failed first fetch is an error, requests refuse redirects, the first fetch
+// and each scheduled refresh are bounded by jwksHTTPFetchTimeout, and the set
+// is refreshed every 5 minutes instead of keyfunc's 1-hour default. A failed
+// refresh keeps the last good set and is logged through logger at Error, with
+// the URL, because a status or decoding error does not name it.
+//
+// A token with an unknown kid also triggers a refetch, at most one every 5
+// minutes. It runs in the request, bounded by keyfunc's RateLimitWaitMax
+// (1 minute, rate-limit wait included), not by jwksHTTPFetchTimeout.
+func jwksOverride(logger *slog.Logger, u *url.URL) keyfunc.Override {
+	failFast := false
+
+	return keyfunc.Override{
+		Client:                    &http.Client{CheckRedirect: refuseJWKSetRedirect},
+		NoErrorReturnFirstHTTPReq: &failFast,
+		HTTPTimeout:               jwksHTTPFetchTimeout,
+		RefreshInterval:           5 * time.Minute,
+		// keyfunc passes the URL as configured, so log u redacted instead.
+		RefreshErrorHandlerFunc: func(string) func(context.Context, error) {
+			return func(ctx context.Context, err error) {
+				// A refresh cancelled by a config unload is not a failure; a deadline means it timed out, which is.
+				if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+					return
+				}
+
+				if logger.Enabled(ctx, slog.LevelError) {
+					logger.LogAttrs(ctx, slog.LevelError, "Failed to refresh the JWK Set; the last good set stays in use", slog.String("jwks_url", u.Redacted()), slog.Any("error", err))
+				}
+			}
+		},
+	}
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Middleware.
@@ -1285,9 +1587,216 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return m, m.UnmarshalCaddyfile(h.Dispenser)
 }
 
+// handleStopping handles Caddy's "stopping" event, which fires both when the
+// process exits and when a config reload replaces this configuration; exiting
+// tells the two apart. An exit fires it only for the running configuration, so
+// a hub replaced earlier by a reload while it had requests in flight is
+// retired instead.
+func (m *Mercure) handleStopping(exiting bool) {
+	if exiting {
+		fireExitSignal()
+
+		if shouldDrainOnStopping(exiting, m.DrainTimeout) {
+			m.hub.Drain()
+
+			return
+		}
+
+		m.cancel()
+
+		return
+	}
+
+	m.cancel()
+
+	// With write_timeout 0, cancel has already closed the subscribers.
+	if hasDrainTimeout(m.DrainTimeout) && (m.WriteTimeout == nil || *m.WriteTimeout != 0) {
+		m.retire()
+	}
+}
+
 // shouldDrainOnStopping reports whether to drain; "stopping" also fires on config reloads, which must not drain.
 func shouldDrainOnStopping(exiting bool, drainTimeout *caddy.Duration) bool {
-	return exiting && drainTimeout != nil && time.Duration(*drainTimeout) != 0
+	return exiting && hasDrainTimeout(drainTimeout)
+}
+
+func hasDrainTimeout(drainTimeout *caddy.Duration) bool {
+	return drainTimeout != nil && time.Duration(*drainTimeout) != 0
+}
+
+// retire marks m as replaced by a config reload. It stays in retiredHubs for
+// as long as it has requests in flight, including ones its server accepts
+// after the reload.
+func (m *Mercure) retire() {
+	m.requestsMu.Lock()
+	defer m.requestsMu.Unlock()
+
+	m.retiring = true
+	if m.requests > 0 {
+		addRetiredHub(m)
+	}
+}
+
+func (m *Mercure) requestStarted() {
+	m.requestsMu.Lock()
+	defer m.requestsMu.Unlock()
+
+	m.requests++
+
+	switch {
+	case !m.retiring:
+		// Not replaced by a reload: nothing to track.
+	case m.requests == 1:
+		addRetiredHub(m)
+	default:
+		noteArrival(m)
+	}
+}
+
+func (m *Mercure) requestEnded() {
+	m.requestsMu.Lock()
+	defer m.requestsMu.Unlock()
+
+	m.requests--
+	if m.retiring && m.requests == 0 {
+		hubsMu.Lock()
+		defer hubsMu.Unlock()
+
+		close(exitState.retiredHubs[m])
+		delete(exitState.retiredHubs, m)
+	}
+}
+
+// addRetiredHub adds m to retiredHubs, and drains it if the process is
+// already exiting. The caller holds m.requestsMu.
+func addRetiredHub(m *Mercure) {
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	exitState.retiredHubs[m] = make(chan struct{})
+
+	if !exitState.exitedAt.IsZero() {
+		m.lastArrivalAfterExit = time.Now()
+		m.hub.Drain()
+	}
+}
+
+// noteArrival records a request reaching retired hub m after the exit signal;
+// the caller holds m.requestsMu.
+func noteArrival(m *Mercure) {
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	if !exitState.exitedAt.IsZero() {
+		m.lastArrivalAfterExit = time.Now()
+	}
+}
+
+// fireExitSignal records that the process is exiting and drains the retired
+// hubs; later calls do nothing.
+func fireExitSignal() {
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	if !exitState.exitedAt.IsZero() {
+		return
+	}
+
+	exitState.exitedAt = time.Now()
+
+	for m := range exitState.retiredHubs {
+		m.hub.Drain()
+	}
+}
+
+// registerExitWait registers waitForRetiredHubs as a stop hook of one server
+// of the HTTP app that m belongs to, once per configuration. On a process exit
+// Caddy runs the stop hooks once every server has shut down or the stop's
+// grace_period has ended, so one server is enough.
+func (m *Mercure) registerExitWait(ctx caddy.Context) error {
+	app, err := ctx.App("http")
+	if err != nil {
+		return fmt.Errorf("getting HTTP app: %w", err)
+	}
+
+	httpApp := app.(*caddyhttp.App)
+
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	m.httpApp = httpApp
+
+	if _, ok := exitState.exitWaitApps[httpApp]; ok {
+		return nil
+	}
+
+	for _, srv := range httpApp.Servers {
+		srv.RegisterOnStop(waitForRetiredHubs)
+
+		exitState.exitWaitApps[httpApp] = struct{}{}
+
+		return nil
+	}
+
+	return nil
+}
+
+// waitForRetiredHubs is the stop hook that registerExitWait registers. It
+// waits until no retired hub has a request in flight, bounded per hub by
+// nextRetiredHub's deadline and by ctx, and returns an error if ctx ends
+// first. On a reload it returns at once.
+//
+// On an exit Caddy runs it after the servers have shut down, and before it
+// cleans up the configuration's modules, which closes the transport and so
+// every subscriber on it, including those of the retired hubs.
+func waitForRetiredHubs(ctx context.Context) error {
+	for {
+		idle, deadline, ok := nextRetiredHub(time.Now())
+		if !ok {
+			return nil
+		}
+
+		timer := time.NewTimer(time.Until(deadline))
+
+		select {
+		case <-idle:
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+
+			return fmt.Errorf("waiting for the requests of hubs replaced by a reload: %w", context.Cause(ctx))
+		}
+
+		timer.Stop()
+	}
+}
+
+// nextRetiredHub returns a retired hub to wait for while exiting: the channel
+// closed once it has no request in flight, and its deadline, the end of its
+// drain_timeout counted from the later of the exit signal and the hub's latest
+// arrival after it.
+func nextRetiredHub(now time.Time) (<-chan struct{}, time.Time, bool) {
+	hubsMu.Lock()
+	defer hubsMu.Unlock()
+
+	if exitState.exitedAt.IsZero() {
+		return nil, time.Time{}, false
+	}
+
+	for m, idle := range exitState.retiredHubs {
+		// A request that arrives after the exit signal is drained relative to
+		// its arrival, not to the exit signal.
+		from := exitState.exitedAt
+		if m.lastArrivalAfterExit.After(from) {
+			from = m.lastArrivalAfterExit
+		}
+
+		if deadline := from.Add(time.Duration(*m.DrainTimeout)); deadline.After(now) {
+			return idle, deadline, true
+		}
+	}
+
+	return nil, time.Time{}, false
 }
 
 func parseDurationParameter(d *caddyfile.Dispenser) (*caddy.Duration, error) {

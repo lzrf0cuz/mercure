@@ -56,6 +56,7 @@ This documentation covers the protocol and the Mercure.rocks Hub for the **1.0 r
 - [High availability](production/high-availability.md): scaling beyond one node
 - [Rolling updates](production/rolling-updates.md): graceful shutdown for SSE
 - [Health checks and monitoring](production/health-monitoring.md)
+- [Metrics reference](production/metrics.md): every `mercure_*` Prometheus series
 - [Tracing](production/tracing.md): OpenTelemetry spans
 - [Load testing](production/load-testing.md)
 - [Debugging](production/debugging.md)
@@ -72,6 +73,7 @@ This documentation covers the protocol and the Mercure.rocks Hub for the **1.0 r
 
 - [Awesome Mercure](ecosystem/awesome.md): libraries, integrations, demos
 - [Conformance tests](ecosystem/conformance-tests.md)
+- [Redis/Valkey transport (this repository)](../redistransport/README.md)
 
 ## Mercure support and community
 

@@ -1,10 +1,10 @@
 package mercure
 
 import (
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"slices"
 	"strings"
 
@@ -48,15 +48,7 @@ func (h *Hub) initHandler() {
 			router.HandleFunc(defaultDebugURL+"playground-token", h.PlaygroundTokenHandler).Methods(http.MethodGet, http.MethodHead)
 		}
 
-		public, err := fs.Sub(debuggerContent, "public")
-		if err != nil {
-			panic(err)
-		}
-
-		router.PathPrefix(defaultDebugURL).Handler(http.StripPrefix(defaultDebugURL, http.FileServer(http.FS(public))))
-
-		// The page handles access tokens: everything it loads is vendored, with no inline script or style.
-		csp = "default-src 'self'"
+		router.PathPrefix(defaultDebugURL).Handler(h.debuggerFileHandler())
 	}
 
 	h.registerSubscriptionHandlers(router)
@@ -126,13 +118,14 @@ func (h *Hub) corsHandler(router http.Handler) http.Handler {
 		AllowedOrigins:   h.corsOrigins,
 		AllowCredentials: allowCredentials,
 		AllowedMethods:   []string{http.MethodGet, http.MethodHead, http.MethodPost, methodQuery},
-		AllowedHeaders:   []string{authorizationHeader, "cache-control", "last-event-id"},
+		AllowedHeaders:   h.corsAllowedHeaders(),
 		// Exposed so cross-origin subscribers can read the subscription API's
 		// rel="mercure" Link header, which carries the last-event-id cursor,
 		// and the Mercure-Last-Event-Id field a subscription answers with:
 		// without it, a fetch-based cross-origin subscriber cannot detect
-		// data loss when resuming.
-		ExposedHeaders: []string{"Link", "Mercure-Last-Event-Id", "Accept-Query"},
+		// data loss when resuming. Retry-After carries the back-off of a 429
+		// that sheds a subscriber.
+		ExposedHeaders: []string{"Link", "Mercure-Last-Event-Id", "Accept-Query", "Retry-After"},
 		Debug:          h.debug,
 	}).Handler(router)
 }
@@ -201,4 +194,28 @@ func (h *Hub) registerSubscriptionHandlers(r *mux.Router) {
 	}
 
 	r.HandleFunc(subscriptionsURL, h.SubscriptionsHandler).Methods(http.MethodGet)
+}
+
+// debuggerFileHandler gates playground fixtures using the decoded, cleaned path,
+// matching FileServer's lookup even when mux uses encoded paths and skips cleaning.
+func (h *Hub) debuggerFileHandler() http.Handler {
+	fileServer := http.StripPrefix(defaultDebugURL, http.FileServer(http.FS(publicFS(h.logger))))
+	if h.playground {
+		return fileServer
+	}
+
+	const fixturesPath = "/fixtures"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Strip and anchor exactly as FileServer does, including traversal above its root.
+		// Lower-cased because dev_ui's os.DirFS resolves FIXTURES/ on a case-insensitive filesystem.
+		cleaned := strings.ToLower(path.Clean("/" + strings.TrimPrefix(r.URL.Path, defaultDebugURL)))
+		if cleaned == fixturesPath || strings.HasPrefix(cleaned, fixturesPath+"/") {
+			http.NotFound(w, r)
+
+			return
+		}
+
+		fileServer.ServeHTTP(w, r)
+	})
 }

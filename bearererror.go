@@ -45,8 +45,15 @@ func (h *Hub) writeBearerError(w http.ResponseWriter, r *http.Request, code stri
 //     malformed.
 //
 // insufficient_scope (403) is written directly by the handlers, which know
-// whether a valid token merely lacked a grant.
+// whether a valid token merely lacked a grant. A claim binding rejection is
+// answered by writeBindingRejection instead.
 func (h *Hub) writeAuthError(w http.ResponseWriter, r *http.Request, err error) {
+	if be, ok := errors.AsType[*claimBindingError](err); ok {
+		h.writeBindingRejection(w, r, be)
+
+		return
+	}
+
 	switch {
 	case err == nil:
 		h.writeBearerChallenge(w, r)
@@ -65,6 +72,23 @@ func (h *Hub) writeAuthError(w http.ResponseWriter, r *http.Request, err error) 
 	ctx := r.Context()
 	if err != nil && h.logger.Enabled(ctx, slog.LevelInfo) {
 		h.logger.LogAttrs(ctx, slog.LevelInfo, "Authorization error", slog.Any("error", err))
+	}
+}
+
+// writeBindingRejection answers a claim binding rejection with the status and RFC 6750
+// error code claimBindingError.response maps it to, the Bearer challenge included unless
+// the request itself was malformed. Like a token rejection, it is logged at Info.
+func (h *Hub) writeBindingRejection(w http.ResponseWriter, r *http.Request, err *claimBindingError) {
+	status, code := err.response()
+	if code == "" {
+		http.Error(w, http.StatusText(status), status)
+	} else {
+		h.writeBearerError(w, r, code, status)
+	}
+
+	ctx := r.Context()
+	if h.logger.Enabled(ctx, slog.LevelInfo) {
+		h.logger.LogAttrs(ctx, slog.LevelInfo, "Claim binding rejected the request", slog.Any("error", err))
 	}
 }
 
