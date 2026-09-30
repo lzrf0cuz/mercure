@@ -122,3 +122,46 @@ func TestLiveQueueBoundedBeforeReady(t *testing.T) {
 	assert.Len(t, s.liveQueue, outBufferLength-1)
 	assert.Zero(t, s.Ready(ctx))
 }
+
+func TestNewLocalSubscriberOutBuffer(t *testing.T) {
+	t.Parallel()
+
+	tms := &TopicMatcherStore{}
+
+	t.Run("default when unconfigured", func(t *testing.T) {
+		t.Parallel()
+
+		s := NewLocalSubscriber("", slog.Default(), tms)
+		assert.Equal(t, outBufferLength, cap(s.out))
+	})
+
+	t.Run("custom value sizes the out channel", func(t *testing.T) {
+		t.Parallel()
+
+		s := NewLocalSubscriber("", slog.Default(), tms, withOutBuffer(32))
+		assert.Equal(t, 32, cap(s.out))
+	})
+
+	t.Run("zero from an unconfigured hub falls back to default", func(t *testing.T) {
+		t.Parallel()
+
+		s := NewLocalSubscriber("", slog.Default(), tms, withOutBuffer(0))
+		assert.Equal(t, outBufferLength, cap(s.out))
+	})
+}
+
+// TestLocalSubscriberLiveQueueHonorsConfiguredBuffer: a smaller configured buffer
+// sheds the pre-ready liveQueue earlier. The subscriber is not Ready, so dispatches
+// take the liveQueue path, bounded by the out channel's free capacity.
+func TestLocalSubscriberLiveQueueHonorsConfiguredBuffer(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	s := NewLocalSubscriber("", slog.Default(), &TopicMatcherStore{}, withOutBuffer(MinSubscriberOutBuffer))
+
+	for range MinSubscriberOutBuffer {
+		assert.True(t, s.Dispatch(ctx, &Update{}, false), "updates up to the configured bound are queued")
+	}
+
+	assert.False(t, s.Dispatch(ctx, &Update{}, false), "exceeding the configured (small) bound sheds, well below the default 1000")
+}

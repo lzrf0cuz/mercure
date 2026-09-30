@@ -29,6 +29,10 @@ const (
 // ErrUnsupportedProtocolVersion is returned when the version passed is unsupported.
 var ErrUnsupportedProtocolVersion = errors.New("compatibility mode only supports protocol versions 7 and 8")
 
+// ErrInvalidSubscriberOutBuffer is returned by WithSubscriberOutBuffer for a
+// value that is neither 0 nor at least MinSubscriberOutBuffer.
+var ErrInvalidSubscriberOutBuffer = errors.New("subscriber out buffer must be 0 (use the default) or at least the minimum")
+
 // ErrInvalidResourceIdentifier is returned when the configured resource
 // identifier is not an RFC 9728 protected resource identifier: an absolute
 // URL without a fragment component.
@@ -199,11 +203,54 @@ func WithDispatchTimeout(timeout time.Duration) Option {
 	}
 }
 
+// WithPublishTimeout bounds the dispatch of a single publish (disabled by
+// default). Dispatch runs detached from the publisher's request, so a client
+// disconnect doesn't abort it.
+//
+// Bolt and Local ignore the deadline. The Redis transport checks it while
+// waiting for the publisher rate limit, a pooled connection or a retry, and
+// cuts a command already sent when its go-redis client sets
+// ContextTimeoutEnabled (the Caddy module does). Without that option the
+// command runs until the client's read timeout: if it then fails, the 504
+// comes late; if the reply arrives first, the publish succeeds late. On
+// timeout PublishHandler returns 504 and the update may already be stored.
+// The hub doesn't deduplicate: a publisher that set an id should retry with
+// the same one so subscribers can drop the duplicate.
+//
+// A transport must return a deadline error only for ctx's own deadline; a
+// transport-internal deadline must be reported as a different error, otherwise
+// it may be answered as a publish timeout.
+func WithPublishTimeout(timeout time.Duration) Option {
+	return func(o *opt) error {
+		o.publishTimeout = timeout
+
+		return nil
+	}
+}
+
 // WithHeartbeat sets the frequency of the SSE keep-alive comments, defaults
 // to 40s, set to 0 to disable.
 func WithHeartbeat(interval time.Duration) Option {
 	return func(o *opt) error {
 		o.heartbeat = interval
+
+		return nil
+	}
+}
+
+// WithSubscriberOutBuffer sets the per-subscriber out-channel capacity (default
+// 1000), which also bounds the pre-ready queue. Each connected subscriber
+// commits this many *Update slots up front, so a large fleet may want it lower
+// to cut steady-state memory and cold-start allocation pressure. 0 keeps the
+// default; a positive value below MinSubscriberOutBuffer is rejected, since a buffer
+// that small sheds live updates.
+func WithSubscriberOutBuffer(size int) Option {
+	return func(o *opt) error {
+		if size != 0 && size < MinSubscriberOutBuffer {
+			return fmt.Errorf("%w %d, got %d", ErrInvalidSubscriberOutBuffer, MinSubscriberOutBuffer, size)
+		}
+
+		o.subscriberOutBuffer = size
 
 		return nil
 	}
@@ -445,12 +492,29 @@ func WithResourceIdentifier(resourceIdentifier string) Option {
 	}
 }
 
+// WithCodec sets the Codec used for serializing updates in transports.
+// NewHub passes it to the transport through TransportCodec.SetCodec, once,
+// and only when the codec is non-nil and the transport implements
+// TransportCodec. Without this option the hub does not call SetCodec, and
+// the transport keeps whatever codec it already has: its own default,
+// unless an earlier hub already called SetCodec on it (a transport can be
+// reused across hubs, e.g. Caddy's usage pool keeps one live across
+// reloads).
+func WithCodec(c Codec) Option {
+	return func(o *opt) error {
+		o.codec = c
+
+		return nil
+	}
+}
+
 // opt contains the available options.
 //
 // If you change this, also update the Caddy module and the documentation.
 type opt struct {
 	transport                    Transport
 	topicMatcherStore            *TopicMatcherStore
+	codec                        Codec
 	anonymous                    bool
 	debug                        bool
 	subscriptions                bool
@@ -462,6 +526,8 @@ type opt struct {
 	drainTimeout                 time.Duration
 	dispatchTimeout              time.Duration
 	heartbeat                    time.Duration
+	publishTimeout               time.Duration
+	subscriberOutBuffer          int
 	maxRequestBodySize           int64
 	issuers                      map[string]issuerVerifier
 	publisherConfigured          bool
@@ -478,6 +544,7 @@ type opt struct {
 	resourceMetadataURL          string
 	authorizationServers         []string
 	shortHMACKeys                []shortHMACKey
+	claimHeaderBindings          []ClaimHeaderBinding
 }
 
 // shortHMACKey records a weak HMAC key until the logger is known.
@@ -640,10 +707,24 @@ func NewHub(ctx context.Context, options ...Option) (*Hub, error) {
 		opt.cookieName = defaultCookieName
 	}
 
+	if err := opt.applyForkOptions(); err != nil {
+		return nil, err
+	}
+
 	h := &Hub{opt: opt, ctx: ctx, drainCh: make(chan struct{})}
 	h.initHandler()
 
 	return h, nil
+}
+
+// applyForkOptions runs once NewHub has set every default: it hands the codec to the
+// transport and runs the set-level claim binding checks.
+func (o *opt) applyForkOptions() error {
+	if tc, ok := o.transport.(TransportCodec); ok && o.codec != nil {
+		tc.SetCodec(o.codec)
+	}
+
+	return o.validateClaimHeaderBindings()
 }
 
 // Stop stops the hub.

@@ -18,17 +18,52 @@ type LocalSubscriber struct {
 	responseLastEventID chan string
 	ready               atomic.Bool
 	liveQueue           []*Update
+	// counted is the header value matched by the binding that counts subscribers, with that
+	// binding's identity; its value is empty when no binding counts it. Set once, before the
+	// subscriber is added to the transport.
+	counted bindingValue
 }
 
+// outBufferLength is the default capacity of the out channel, which also bounds
+// the pre-ready liveQueue (see Dispatch). WithSubscriberOutBuffer overrides it.
 const outBufferLength = 1000
 
+// MinSubscriberOutBuffer floors the configurable out buffer: below this the
+// stream drops live updates too eagerly. WithSubscriberOutBuffer and the
+// Caddyfile parser reject a positive value under this floor.
+const MinSubscriberOutBuffer = 16
+
+// localSubscriberOption configures a LocalSubscriber at construction. Unexported
+// so the out-buffer size stays a hub-internal knob (set via the Hub's
+// WithSubscriberOutBuffer); external NewLocalSubscriber callers keep the default.
+type localSubscriberOption func(*localSubscriberConfig)
+
+type localSubscriberConfig struct {
+	outBufferLength int
+}
+
+// withOutBuffer sets the out channel capacity; 0, from a hub without
+// WithSubscriberOutBuffer, keeps the default.
+func withOutBuffer(n int) localSubscriberOption {
+	return func(c *localSubscriberConfig) {
+		if n > 0 {
+			c.outBufferLength = n
+		}
+	}
+}
+
 // NewLocalSubscriber creates a new subscriber.
-func NewLocalSubscriber(lastEventID string, logger *slog.Logger, topicMatcherStore *TopicMatcherStore) *LocalSubscriber {
+func NewLocalSubscriber(lastEventID string, logger *slog.Logger, topicMatcherStore *TopicMatcherStore, opts ...localSubscriberOption) *LocalSubscriber {
+	cfg := localSubscriberConfig{outBufferLength: outBufferLength}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	id := "urn:uuid:" + uuid.NewV4().String()
 	s := &LocalSubscriber{
 		Subscriber:          *NewSubscriber(logger, topicMatcherStore),
 		responseLastEventID: make(chan string, 1),
-		out:                 make(chan *Update, outBufferLength),
+		out:                 make(chan *Update, cfg.outBufferLength),
 	}
 
 	s.ID = id

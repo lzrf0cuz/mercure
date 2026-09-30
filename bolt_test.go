@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 
@@ -360,6 +363,110 @@ func TestBoltLastEventID(t *testing.T) {
 
 	lastEventID, _, _ := transport.GetSubscribers(t.Context())
 	assert.Equal(t, "foo", lastEventID)
+}
+
+// putRawBoltKey writes a key straight into the transport's bucket, bypassing
+// the sequence prefix Mercure gives every key it writes.
+func putRawBoltKey(t *testing.T, transport *BoltTransport, key string) {
+	t.Helper()
+
+	require.NoError(t, transport.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(transport.bucketName)).Put([]byte(key), []byte("{}"))
+	}))
+}
+
+// A key shorter than the 8-byte sequence prefix comes from a bucket not written
+// by Mercure or a corrupted file; the hub must refuse to start, not panic.
+func TestBoltTransportShortKeyFailsStartup(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "bolt.db")
+
+	db, err := bolt.Open(path, 0o600, nil)
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(defaultBoltBucketName))
+		require.NoError(t, err)
+
+		return bucket.Put([]byte("abc"), []byte("{}"))
+	}))
+	require.NoError(t, db.Close())
+
+	var transport *BoltTransport
+
+	require.NotPanics(t, func() {
+		transport, err = NewBoltTransport(NewSubscriberList(0), slog.Default(), path, defaultBoltBucketName, 0, 0)
+	})
+	require.Error(t, err)
+	assert.Nil(t, transport)
+	require.ErrorIs(t, err, errForeignBoltKey)
+	assert.ErrorContains(t, err, `bucket "`+defaultBoltBucketName+`"`)
+}
+
+// A short key sorting before every real one is skipped by the id search.
+func TestBoltTransportHistorySkipsShortKey(t *testing.T) {
+	t.Parallel()
+
+	transport := createBoltTransport(t, 0, 0)
+	topic := "https://example.com/foo"
+
+	for _, id := range []string{"a", "b", "c"} {
+		require.NoError(t, transport.Dispatch(t.Context(), &Update{ID: id, Topics: []string{topic}}))
+	}
+
+	putRawBoltKey(t, transport, "\x00")
+
+	s := NewLocalSubscriber("a", transport.logger, &TopicMatcherStore{})
+	s.RequestLastEventIDSet = true
+	s.SetMatchers([]TopicMatcher{{Type: MatcherTypeExact, Pattern: topic}}, nil)
+
+	require.NotPanics(t, func() {
+		require.NoError(t, transport.AddSubscriber(t.Context(), s))
+	})
+	assert.Equal(t, "a", <-s.responseLastEventID)
+	assert.Equal(t, "b", (<-s.Receive()).ID)
+	assert.Equal(t, "c", (<-s.Receive()).ID)
+
+	s.Disconnect()
+}
+
+// A short key sorting after every real one is met by the replay: it errors.
+func TestBoltTransportReplayRejectsShortKey(t *testing.T) {
+	t.Parallel()
+
+	transport := createBoltTransport(t, 0, 0)
+	topic := "https://example.com/foo"
+
+	require.NoError(t, transport.Dispatch(t.Context(), &Update{ID: "a", Topics: []string{topic}}))
+	putRawBoltKey(t, transport, "\xff")
+
+	s := NewLocalSubscriber(EarliestLastEventID, transport.logger, &TopicMatcherStore{})
+	s.RequestLastEventIDSet = true
+	s.SetMatchers([]TopicMatcher{{Type: MatcherTypeExact, Pattern: topic}}, nil)
+
+	var err error
+
+	require.NotPanics(t, func() { err = transport.AddSubscriber(t.Context(), s) })
+	require.ErrorIs(t, err, errForeignBoltKey)
+
+	s.Disconnect()
+}
+
+// The cleanup pass starts from the oldest key, so a short key sorting first is
+// met on the next publish past the size limit: it errors.
+func TestBoltTransportCleanupRejectsShortKey(t *testing.T) {
+	t.Parallel()
+
+	transport := createBoltTransport(t, 1, 1)
+	topic := "https://example.com/foo"
+
+	require.NoError(t, transport.Dispatch(t.Context(), &Update{ID: "a", Topics: []string{topic}}))
+	putRawBoltKey(t, transport, "\x00")
+
+	var err error
+
+	require.NotPanics(t, func() { err = transport.Dispatch(t.Context(), &Update{ID: "b", Topics: []string{topic}}) })
+	require.ErrorIs(t, err, errForeignBoltKey)
 }
 
 // cleanup_frequency is documented as the probability of running a cleanup pass
@@ -850,4 +957,146 @@ func TestBoltTransportCleanupRemovesEveryExpiredEntry(t *testing.T) {
 
 		return nil
 	}))
+}
+
+// Close closes the database under a Dispatch or a history replay that passed
+// the closed check: bbolt's database-not-open error must then satisfy
+// errors.Is(err, ErrClosedTransport), or the hub logs a shutdown as a failure.
+// The database is closed directly, leaving the transport's closed check open,
+// to reach the paths after it.
+func TestBoltTransportDatabaseClosedUnderCallIsClosedTransport(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		call func(ctx context.Context, transport *BoltTransport) error
+	}{
+		{"Dispatch", func(ctx context.Context, transport *BoltTransport) error {
+			return transport.Dispatch(ctx, &Update{Topics: []string{"https://example.com/foo"}})
+		}},
+		{"AddSubscriber history replay", func(ctx context.Context, transport *BoltTransport) error {
+			s := NewLocalSubscriber(EarliestLastEventID, transport.logger, &TopicMatcherStore{})
+
+			return transport.AddSubscriber(ctx, s)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport, err := NewBoltTransport(NewSubscriberList(0), slog.Default(), filepath.Join(t.TempDir(), "bolt.db"), defaultBoltBucketName, 0, 0)
+			require.NoError(t, err)
+
+			require.NoError(t, transport.db.Close())
+
+			err = tc.call(t.Context(), transport)
+			require.ErrorIs(t, err, ErrClosedTransport)
+			require.ErrorIs(t, err, errors.ErrDatabaseNotOpen, "the cause stays reachable")
+		})
+	}
+}
+
+// A subscriber added while Close runs must end up rejected or disconnected,
+// never registered on a closed transport. The adders race Close because
+// BoltTransport.Close closes t.closed before taking the lock, so the
+// interleaving can't be forced through the lock.
+func TestTransportAddSubscriberRacingClose(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("needs GOMAXPROCS >= 2")
+	}
+
+	for _, tc := range []struct {
+		name         string
+		newTransport func(t *testing.T, sl *SubscriberList) Transport
+	}{
+		{"Local", func(_ *testing.T, sl *SubscriberList) Transport {
+			return NewLocalTransport(sl)
+		}},
+		{"Bolt", func(t *testing.T, sl *SubscriberList) Transport {
+			t.Helper()
+
+			transport, err := NewBoltTransport(sl, slog.Default(), filepath.Join(t.TempDir(), "bolt.db"), defaultBoltBucketName, 0, 0)
+			require.NoError(t, err)
+
+			return transport
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			testAddSubscriberRacingClose(t, tc.newTransport)
+		})
+	}
+}
+
+func testAddSubscriberRacingClose(t *testing.T, newTransport func(t *testing.T, sl *SubscriberList) Transport) {
+	t.Helper()
+
+	const (
+		iterations = 100
+		adders     = 8
+	)
+
+	ctx := t.Context()
+
+	for i := range iterations {
+		sl := NewSubscriberList(0)
+		transport := newTransport(t, sl)
+
+		var (
+			wg       sync.WaitGroup
+			mu       sync.Mutex
+			accepted []*LocalSubscriber
+			added    atomic.Int64
+			// Adders only return on error: fail now instead of at the test timeout.
+			exited = make(chan error, adders)
+		)
+
+		for range adders {
+			wg.Go(func() {
+				for {
+					s := NewLocalSubscriber("", slog.Default(), &TopicMatcherStore{})
+					if err := transport.AddSubscriber(ctx, s); err != nil {
+						assert.ErrorIs(t, err, ErrClosedTransport)
+						assert.False(t, subscriberListed(sl, s), "a rejected subscriber must not stay registered")
+
+						exited <- err
+
+						return
+					}
+
+					mu.Lock()
+
+					accepted = append(accepted, s)
+
+					mu.Unlock()
+					added.Add(1)
+
+					// Let Close run between adds when adders outnumber Ps.
+					runtime.Gosched()
+				}
+			})
+		}
+
+		for added.Load() < adders {
+			select {
+			case err := <-exited:
+				// Stop the remaining adders before failing.
+				_ = transport.Close(ctx)
+
+				wg.Wait()
+				t.Fatalf("iteration %d: AddSubscriber failed before Close: %v", i, err)
+			default:
+				runtime.Gosched()
+			}
+		}
+
+		require.NoError(t, transport.Close(ctx))
+		wg.Wait()
+
+		for _, s := range accepted {
+			require.NotZero(t, s.disconnected.Load(), "iteration %d: subscriber added after Close must be disconnected", i)
+		}
+	}
 }

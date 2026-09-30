@@ -7,10 +7,14 @@
   "scripts": {
     "vendor": "node vendor.js",
     "upgrade": "node upgrade.js",
-    "check": "node check.js"
+    "check": "node check.js && node outdated.js"
   },
   "dependencies": {
-    "@microsoft/fetch-event-source": "2.0.1"
+    "@creativebulma/bulma-tooltip": "1.2.0",
+    "@fortawesome/fontawesome-free": "7.3.1",
+    "bulma": "1.0.4",
+    "eventsource-parser": "4.1.1",
+    "highlight.js": "11.12.0"
   },
   "devDependencies": {
     "esbuild": "0.28.2"

@@ -1316,10 +1316,18 @@ func BenchmarkSubscribe(b *testing.B) {
 func hubShutdownTestHub(ctx context.Context, tb testing.TB, writeTimeout time.Duration) *Hub {
 	tb.Helper()
 
+	return hubShutdownTestHubWithOptions(ctx, tb, writeTimeout)
+}
+
+// hubShutdownTestHubWithOptions builds a hub like hubShutdownTestHub, with
+// extra options appended (e.g. WithMetrics for the disconnect-reason tests).
+func hubShutdownTestHubWithOptions(ctx context.Context, tb testing.TB, writeTimeout time.Duration, extra ...Option) *Hub {
+	tb.Helper()
+
 	tms, err := NewTopicMatcherStore(0)
 	require.NoError(tb, err)
 
-	h, err := NewHub(ctx,
+	opts := append([]Option{
 		WithAnonymous(),
 		WithIssuers([]Issuer{{
 			Identifier: testIssuer,
@@ -1329,7 +1337,9 @@ func hubShutdownTestHub(ctx context.Context, tb testing.TB, writeTimeout time.Du
 		WithResourceIdentifier(testResourceIdentifier),
 		WithTopicMatcherStore(tms),
 		WithWriteTimeout(writeTimeout),
-	)
+	}, extra...)
+
+	h, err := NewHub(ctx, opts...)
 	require.NoError(tb, err)
 
 	return h
@@ -1545,6 +1555,38 @@ func TestDrainWithoutWriteTimeout(t *testing.T) {
 		transport.RUnlock()
 		assert.Equal(t, 0, n, "drain must arm a disconnection timer even when writeTimeout is 0")
 	})
+}
+
+// Connections ended by a drain are reported as write_timeout, never hub_shutdown:
+// the hub context is cancelled only after the drain (see docs/production/metrics.md).
+func TestDrainReportsWriteTimeoutDisconnectReason(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		writeTimeout time.Duration
+	}{
+		{name: "write timeout later than the drain", writeTimeout: 20 * time.Minute},
+		{name: "no write timeout", writeTimeout: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				const drainTimeout = 5 * time.Minute
+
+				metrics := &recordingMetrics{}
+				hub := hubDrainTestHub(t.Context(), t, tc.writeTimeout, drainTimeout, WithMetrics(metrics))
+
+				runSubscribeUntilIdle(t.Context(), t, hub, newSubscribeRecorder(), func(*LocalTransport) {
+					hub.Drain()
+					time.Sleep(drainTimeout + time.Second)
+				})
+
+				assert.Equal(t, []DisconnectReason{DisconnectReasonWriteTimeout}, metrics.reasons())
+			})
+		})
+	}
 }
 
 // Without a deadline, a reload must still close the connection, or Shutdown would hang.
@@ -2065,4 +2107,497 @@ func TestSubscribeIncremental(t *testing.T) {
 	hub.SubscribeHandler(w, req)
 
 	assert.Equal(t, "?1", w.Header().Get("Incremental"))
+}
+
+// outBufferCapturingTransport records the out-channel capacity of the subscriber
+// passed to AddSubscriber, so a test can assert the Hub option propagated.
+type outBufferCapturingTransport struct {
+	nopTransport
+
+	capacity int
+}
+
+func (tr *outBufferCapturingTransport) AddSubscriber(_ context.Context, s *LocalSubscriber) error {
+	tr.capacity = cap(s.out)
+
+	return nil
+}
+
+// TestSubscribeHandlerThreadsOutBuffer proves the Hub option value reaches the
+// created subscriber's channel end-to-end (WithSubscriberOutBuffer →
+// h.subscriberOutBuffer → withOutBuffer → NewLocalSubscriber), not just the
+// lower-level withOutBuffer option in isolation.
+func TestSubscribeHandlerThreadsOutBuffer(t *testing.T) {
+	t.Parallel()
+
+	tr := &outBufferCapturingTransport{}
+	hub := createAnonymousDummy(t, WithTransport(tr), WithSubscriberOutBuffer(32))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, defaultHubURL+"?match=https://example.com/foo", nil).WithContext(ctx)
+
+	// The client goes away as soon as the stream opens.
+	hub.SubscribeHandler(&responseTester{expectedStatusCode: http.StatusOK, expectedBody: ":\n", cancel: cancel, tb: t}, req)
+
+	assert.Equal(t, 32, tr.capacity, "WithSubscriberOutBuffer(32) must size the created subscriber's out channel")
+}
+
+// TestWithSubscriberOutBufferRejectsSubMinimum: a positive value below the floor
+// is rejected at construction (not silently coerced to the default); 0 means
+// "use the default" and at/above the floor is accepted verbatim.
+func TestWithSubscriberOutBufferRejectsSubMinimum(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{-1, 1, MinSubscriberOutBuffer - 1} {
+		_, err := NewHub(t.Context(), WithSubscriberOutBuffer(size))
+		require.ErrorIs(t, err, ErrInvalidSubscriberOutBuffer, "size %d must be rejected, not silently coerced", size)
+	}
+
+	for _, size := range []int{0, MinSubscriberOutBuffer, 4096} {
+		h, err := NewHub(t.Context(), WithSubscriberOutBuffer(size))
+		require.NoError(t, err)
+		assert.Equal(t, size, h.subscriberOutBuffer)
+	}
+}
+
+type writeFlushSample struct {
+	seconds float64
+	ok      bool
+}
+
+// recordingMetrics records connects, the disconnect reasons reported through
+// DisconnectReasonReporter, the plain SubscriberDisconnected calls, and the
+// WriteFlushObserver observations.
+type recordingMetrics struct {
+	mu                  sync.Mutex
+	connected           int
+	disconnected        int
+	disconnectedReasons []DisconnectReason
+	writeFlushes        []writeFlushSample
+}
+
+func (m *recordingMetrics) SubscriberConnected(*LocalSubscriber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.connected++
+}
+
+func (m *recordingMetrics) SubscriberDisconnected(*LocalSubscriber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.disconnected++
+}
+
+func (*recordingMetrics) UpdatePublished(*Update) {}
+
+func (m *recordingMetrics) SubscriberDisconnectedWithReason(_ *LocalSubscriber, reason DisconnectReason) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.disconnectedReasons = append(m.disconnectedReasons, reason)
+}
+
+func (m *recordingMetrics) ObserveWriteFlush(seconds float64, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.writeFlushes = append(m.writeFlushes, writeFlushSample{seconds: seconds, ok: ok})
+}
+
+func (m *recordingMetrics) connects() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.connected
+}
+
+func (m *recordingMetrics) reasons() []DisconnectReason {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.disconnectedReasons)
+}
+
+func (m *recordingMetrics) plainDisconnects() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.disconnected
+}
+
+func (m *recordingMetrics) writeFlushSamples() []writeFlushSample {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.writeFlushes)
+}
+
+// baseOnlyMetrics implements Metrics but not DisconnectReasonReporter, and
+// counts the SubscriberDisconnected calls.
+type baseOnlyMetrics struct {
+	mu           sync.Mutex
+	disconnected int
+}
+
+func (*baseOnlyMetrics) SubscriberConnected(*LocalSubscriber) {}
+
+func (m *baseOnlyMetrics) SubscriberDisconnected(*LocalSubscriber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.disconnected++
+}
+
+func (*baseOnlyMetrics) UpdatePublished(*Update) {}
+
+func (m *baseOnlyMetrics) plainDisconnects() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.disconnected
+}
+
+// noWriteFlushObserverMetrics implements Metrics but not WriteFlushObserver.
+type noWriteFlushObserverMetrics struct{}
+
+func (noWriteFlushObserverMetrics) SubscriberConnected(*LocalSubscriber)    {}
+func (noWriteFlushObserverMetrics) SubscriberDisconnected(*LocalSubscriber) {}
+func (noWriteFlushObserverMetrics) UpdatePublished(*Update)                 {}
+
+// stubStreamWriter is a flushable ResponseWriter with deadline support whose
+// Write, FlushError and SetWriteDeadline return the configured errors. By
+// default it models HTTP/1: once a Write failed the next FlushError reports
+// that error. With flushForgetsWriteErr it reproduces the sequence HTTP/2
+// produces after a failed write that bypassed the buffer: every Write fails,
+// FlushError returns nil, SetWriteDeadline returns nil.
+type stubStreamWriter struct {
+	header      http.Header
+	writeErr    error
+	flushErr    error
+	deadlineErr error
+
+	flushForgetsWriteErr bool
+
+	writeFailed error
+}
+
+func (w *stubStreamWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = http.Header{}
+	}
+
+	return w.header
+}
+
+func (w *stubStreamWriter) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		if !w.flushForgetsWriteErr {
+			w.writeFailed = w.writeErr
+		}
+
+		return 0, w.writeErr
+	}
+
+	return len(p), nil
+}
+
+func (*stubStreamWriter) WriteHeader(int) {}
+
+func (w *stubStreamWriter) FlushError() error {
+	if w.writeFailed != nil {
+		return w.writeFailed
+	}
+
+	return w.flushErr
+}
+
+func (w *stubStreamWriter) SetWriteDeadline(time.Time) error { return w.deadlineErr }
+
+// errTransportOffline is what errorRemovingTransport's RemoveSubscriber returns.
+var errTransportOffline = errors.New("transport offline")
+
+// errorRemovingTransport is a LocalTransport whose RemoveSubscriber fails with removeErr.
+type errorRemovingTransport struct {
+	*LocalTransport
+
+	removeErr error
+}
+
+func (t *errorRemovingTransport) RemoveSubscriber(context.Context, *LocalSubscriber) error {
+	return t.removeErr
+}
+
+// runSubscribeUntilIdle starts a subscription on w in the synctest bubble,
+// waits for it to register and block, then runs act (which may be nil) and
+// waits for the bubble to go idle.
+func runSubscribeUntilIdle(ctx context.Context, t *testing.T, hub *Hub, w http.ResponseWriter, act func(transport *LocalTransport)) {
+	t.Helper()
+
+	transport, _ := hub.transport.(*LocalTransport)
+
+	go func() {
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, defaultHubURL+"?match=https://example.com/books/1", nil)
+		hub.SubscribeHandler(w, req)
+	}()
+
+	synctest.Wait()
+
+	transport.RLock()
+	registered := transport.subscribers.Len()
+	transport.RUnlock()
+
+	require.Equal(t, 1, registered, "the subscriber must be registered")
+
+	if act != nil {
+		act(transport)
+	}
+
+	synctest.Wait()
+}
+
+// dispatchBook dispatches an update the subscription of runSubscribeUntilIdle receives.
+func dispatchBook(t *testing.T) func(transport *LocalTransport) {
+	t.Helper()
+
+	return func(transport *LocalTransport) {
+		require.NoError(t, transport.Dispatch(t.Context(), &Update{
+			Topics: []string{"https://example.com/books/1"},
+			Data:   "book",
+		}))
+	}
+}
+
+// Each way out of SubscribeHandler's loop is reported with its reason, through
+// DisconnectReasonReporter only: SubscriberDisconnected must not
+// also count it. Each exit follows exactly one SubscriberConnected.
+func TestSubscribeHandlerReportsDisconnectReason(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		writeTimeout time.Duration
+		options      []Option
+		writer       func() http.ResponseWriter
+		// act runs once the subscriber is registered; cancelHub and
+		// cancelReq cancel the hub's and the request's contexts.
+		act  func(t *testing.T, transport *LocalTransport, cancelHub, cancelReq context.CancelFunc)
+		want DisconnectReason
+	}{
+		{
+			name: "hub shutdown",
+			writer: func() http.ResponseWriter {
+				return newSubscribeRecorder()
+			},
+			act: func(_ *testing.T, _ *LocalTransport, cancelHub, _ context.CancelFunc) {
+				cancelHub()
+			},
+			want: DisconnectReasonHubShutdown,
+		},
+		{
+			name:         "client closed",
+			writeTimeout: 5 * time.Minute,
+			writer: func() http.ResponseWriter {
+				return newSubscribeRecorder()
+			},
+			act: func(_ *testing.T, _ *LocalTransport, _, cancelReq context.CancelFunc) {
+				cancelReq()
+			},
+			want: DisconnectReasonClientClosed,
+		},
+		{
+			// Subscriptions enabled: the connect is reported as when they are not.
+			name:         "client closed with subscriptions",
+			writeTimeout: 5 * time.Minute,
+			options:      []Option{WithSubscriptions()},
+			writer: func() http.ResponseWriter {
+				return newSubscribeRecorder()
+			},
+			act: func(_ *testing.T, _ *LocalTransport, _, cancelReq context.CancelFunc) {
+				cancelReq()
+			},
+			want: DisconnectReasonClientClosed,
+		},
+		{
+			// writeTimeout is shorter than the default dispatchTimeout, so the
+			// timer is armed at the write deadline itself.
+			name:         "write timeout",
+			writeTimeout: 100 * time.Millisecond,
+			writer: func() http.ResponseWriter {
+				return newSubscribeRecorder()
+			},
+			act: func(*testing.T, *LocalTransport, context.CancelFunc, context.CancelFunc) {
+				time.Sleep(101 * time.Millisecond)
+			},
+			want: DisconnectReasonWriteTimeout,
+		},
+		{
+			// HTTP/1 model: the Flush after the failed Write reports it too.
+			name:         "update write failed",
+			writeTimeout: 5 * time.Minute,
+			writer: func() http.ResponseWriter {
+				return &stubStreamWriter{writeErr: io.ErrClosedPipe}
+			},
+			act: func(t *testing.T, transport *LocalTransport, _, _ context.CancelFunc) {
+				t.Helper()
+
+				dispatchBook(t)(transport)
+			},
+			want: DisconnectReasonWriteFailed,
+		},
+		{
+			// HTTP/2 model: the Flush after the failed Write returns nil, so
+			// only the Write's own error can classify the exit.
+			name:         "update write failed, flush reports nothing",
+			writeTimeout: 5 * time.Minute,
+			writer: func() http.ResponseWriter {
+				return &stubStreamWriter{writeErr: io.ErrClosedPipe, flushForgetsWriteErr: true}
+			},
+			act: func(t *testing.T, transport *LocalTransport, _, _ context.CancelFunc) {
+				t.Helper()
+
+				dispatchBook(t)(transport)
+			},
+			want: DisconnectReasonWriteFailed,
+		},
+		{
+			name:         "heartbeat write failed",
+			writeTimeout: 5 * time.Minute,
+			options:      []Option{WithHeartbeat(50 * time.Millisecond)},
+			writer: func() http.ResponseWriter {
+				return &stubStreamWriter{writeErr: io.ErrClosedPipe}
+			},
+			act: func(*testing.T, *LocalTransport, context.CancelFunc, context.CancelFunc) {
+				time.Sleep(100 * time.Millisecond)
+			},
+			want: DisconnectReasonWriteFailed,
+		},
+		{
+			name:         "transport ended",
+			writeTimeout: 5 * time.Minute,
+			writer: func() http.ResponseWriter {
+				return newSubscribeRecorder()
+			},
+			act: func(t *testing.T, transport *LocalTransport, _, _ context.CancelFunc) {
+				t.Helper()
+
+				require.NoError(t, transport.Close(t.Context()))
+			},
+			want: DisconnectReasonTransportEnded,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				metrics := &recordingMetrics{}
+				hubCtx, cancelHub := context.WithCancel(t.Context())
+				hub := hubShutdownTestHubWithOptions(hubCtx, t, tc.writeTimeout, append([]Option{WithMetrics(metrics)}, tc.options...)...)
+				reqCtx, cancelReq := context.WithCancel(t.Context())
+
+				runSubscribeUntilIdle(reqCtx, t, hub, tc.writer(), func(transport *LocalTransport) {
+					tc.act(t, transport, cancelHub, cancelReq)
+				})
+
+				assert.Equal(t, []DisconnectReason{tc.want}, metrics.reasons())
+				assert.Equal(t, 1, metrics.connects(), "one SubscriberConnected per handler exit, subscriptions enabled or not")
+				assert.Zero(t, metrics.plainDisconnects(), "SubscriberDisconnected must not also count the disconnect")
+			})
+		})
+	}
+}
+
+// A Metrics without DisconnectReasonReporter still gets SubscriberDisconnected.
+func TestSubscribeHandlerBaseMetricsFallback(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		metrics := &baseOnlyMetrics{}
+		hubCtx, cancelHub := context.WithCancel(t.Context())
+		hub := hubShutdownTestHubWithOptions(hubCtx, t, 0, WithMetrics(metrics))
+
+		runSubscribeUntilIdle(t.Context(), t, hub, newSubscribeRecorder(), func(*LocalTransport) { cancelHub() })
+
+		assert.Equal(t, 1, metrics.plainDisconnects())
+	})
+}
+
+// Every write is observed with its outcome, failures included, whichever
+// step failed.
+func TestWriteObserverOutcome(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		writer     http.ResponseWriter
+		wantFailed bool
+	}{
+		{name: "healthy", writer: newSubscribeRecorder()},
+		{name: "write fails", writer: &stubStreamWriter{writeErr: io.ErrClosedPipe}, wantFailed: true},
+		{name: "write fails, flush reports nothing", writer: &stubStreamWriter{writeErr: io.ErrClosedPipe, flushForgetsWriteErr: true}, wantFailed: true},
+		{name: "flush fails", writer: &stubStreamWriter{flushErr: io.ErrShortWrite}, wantFailed: true},
+		// Needs a dispatch timeout to set the dispatch deadline at all.
+		{name: "deadline fails", writer: &stubStreamWriter{deadlineErr: io.ErrClosedPipe}, wantFailed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			synctest.Test(t, func(t *testing.T) {
+				metrics := &recordingMetrics{}
+				hub := hubShutdownTestHubWithOptions(t.Context(), t, 5*time.Minute, WithMetrics(metrics), WithDispatchTimeout(100*time.Millisecond))
+
+				runSubscribeUntilIdle(t.Context(), t, hub, tc.writer, dispatchBook(t))
+
+				samples := metrics.writeFlushSamples()
+				require.Len(t, samples, 1)
+				assert.Equal(t, !tc.wantFailed, samples[0].ok)
+				assert.GreaterOrEqual(t, samples[0].seconds, 0.0)
+			})
+		})
+	}
+}
+
+// Without WriteFlushObserver, writes still go through.
+func TestWriteObserverNonImplementerNoOps(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		hub := hubShutdownTestHubWithOptions(t.Context(), t, 5*time.Minute, WithMetrics(noWriteFlushObserverMetrics{}))
+		recorder := newSubscribeRecorder()
+
+		runSubscribeUntilIdle(t.Context(), t, hub, recorder, dispatchBook(t))
+
+		assert.Contains(t, recorder.Body.String(), "data: book")
+	})
+}
+
+// A RemoveSubscriber failure turns an unclassified exit into transport_error,
+// keeps a reason the loop already classified, and is logged.
+func TestShutdownReasonOnTransportError(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		in, want DisconnectReason
+	}{
+		{in: DisconnectReasonUnknown, want: DisconnectReasonTransportError},
+		{in: DisconnectReasonWriteFailed, want: DisconnectReasonWriteFailed},
+	} {
+		t.Run(string(tc.in), func(t *testing.T) {
+			t.Parallel()
+
+			metrics := &recordingMetrics{}
+			logs := &recordingLogHandler{}
+			hub := hubShutdownTestHubWithOptions(t.Context(), t, 0, WithMetrics(metrics), WithLogger(slog.New(logs)))
+			hub.transport = &errorRemovingTransport{LocalTransport: hub.transport.(*LocalTransport), removeErr: errTransportOffline}
+
+			hub.shutdown(t.Context(), NewLocalSubscriber("", slog.Default(), hub.topicMatcherStore), tc.in)
+
+			assert.Equal(t, []DisconnectReason{tc.want}, metrics.reasons())
+			assert.Zero(t, metrics.plainDisconnects())
+			assert.Len(t, logs.withError(slog.LevelError, errTransportOffline), 1, "records: %v", logs.messages())
+		})
+	}
 }

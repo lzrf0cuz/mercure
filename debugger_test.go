@@ -75,7 +75,7 @@ func TestDebugRoutes(t *testing.T) {
 	}{
 		{"config.json with debugger", []Option{WithDebugger()}, "debug/config.json", http.StatusOK},
 		{"config.json without debugger", nil, "debug/config.json", http.StatusNotFound},
-		{"vendored script with debugger", []Option{WithDebugger()}, "debug/vendor/fetch-event-source.js", http.StatusOK},
+		{"vendored script with debugger", []Option{WithDebugger()}, "debug/vendor/eventsource-parser.js", http.StatusOK},
 		{"playground-token with minter", []Option{WithPlayground(), tokenFunc}, "debug/playground-token", http.StatusOK},
 		{"playground-token without minter", []Option{WithPlayground()}, "debug/playground-token", http.StatusNotFound},
 	} {
@@ -90,6 +90,27 @@ func TestDebugRoutes(t *testing.T) {
 			h.ServeHTTP(w, req)
 
 			assert.Equal(t, tc.wantStatus, w.Result().StatusCode)
+		})
+	}
+}
+
+// FileServer clamps traversal at its filesystem root after StripPrefix. The gate
+// must use that same root, even when a decoded path climbs above the debug URL.
+func TestDebuggerFixturesAboveRoot(t *testing.T) {
+	t.Parallel()
+
+	for _, suffix := range []string{
+		"../fixtures/private-jwk.json",
+		"x/../../fixtures/private-jwk.json",
+		"%2e%2e/fixtures/private-jwk.json",
+	} {
+		t.Run(suffix, func(t *testing.T) {
+			t.Parallel()
+
+			hub := createAnonymousDummy(t, WithDebugger())
+			w := httptest.NewRecorder()
+			hub.ServeHTTP(w, httptest.NewRequest(http.MethodGet, defaultDebugURL+suffix, nil))
+			assert.Equal(t, http.StatusNotFound, w.Code)
 		})
 	}
 }
