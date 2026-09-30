@@ -38,7 +38,7 @@ docker run \
 
 The hub is then available at `https://localhost`, with the debug UI at `https://localhost/.well-known/mercure/debug/`.
 
-The image's `HEALTHCHECK` queries the [transport-aware](../production/health-monitoring.md) `/mercure/health/ready` endpoint on the Caddy admin API.
+Images built from this repository's `Dockerfile` have a `HEALTHCHECK` on the [transport-aware](../production/health-monitoring.md) `/mercure/health/live` endpoint of the Caddy admin API.
 
 ## Docker Compose
 
@@ -68,7 +68,7 @@ volumes:
   mercure_config:
 ```
 
-The `/data` volume holds the BoltDB history; `/config` holds Caddy's autosaved configuration. See [Docker deployment](../deployment/docker.md) for healthchecks and rootless mode.
+The `/data` volume holds the BoltDB history; `/config` is Caddy's configuration directory. See [Docker deployment](../deployment/docker.md) for healthchecks and rootless mode.
 
 ## Kubernetes (Helm)
 

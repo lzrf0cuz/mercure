@@ -418,3 +418,11 @@ localhost:9080 {
 
 	received.Wait()
 }
+
+// The legacy subscriber_jwks_url directive reaches the same JWK Set loader as
+// an issuer block's jwks_uri, and must fail Provision the same way.
+func TestJWKSFirstFetchFailureFailsProvisionDeprecated(t *testing.T) {
+	assertJWKSFirstFetchFailureFailsProvision(t, "subscriber", func(url string) string {
+		return fmt.Sprintf(`"protocol_version_compatibility":8,"publisher_jwt":{"key":"test-publisher-key","alg":"HS256"},"subscriber_jwks_url":%q`, url)
+	})
+}

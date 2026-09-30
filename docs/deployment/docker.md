@@ -56,6 +56,8 @@ The `playground` directive turns on:
 
 Don't expose this to the internet.
 
+Images built from this repository run the production `Caddyfile` by default, which refuses `/.well-known/mercure/debug/*`. For the debug UI, run `mercure run -c /etc/caddy/local.Caddyfile`.
+
 ## Compose
 
 Save this as `compose.yaml`, replace the hostnames, then run `docker compose up -d`:
@@ -85,15 +87,15 @@ volumes:
 | Volume    | What's in it                                                   |
 | --------- | -------------------------------------------------------------- |
 | `/data`   | BoltDB history (`/data/caddy/mercure.db`) and Caddy TLS state. |
-| `/config` | Caddy autosaved configuration.                                 |
+| `/config` | Caddy's configuration directory (`XDG_CONFIG_HOME`).           |
 
-Persist `/data` to keep history and TLS state across restarts. `/config` stores Caddy's autosaved configuration.
+Persist `/data` to keep history and TLS state across restarts. `/config` is Caddy's configuration directory. The bundled Caddyfiles set `persist_config off`, so they write no `autosave.json` there, but a custom Caddyfile without that option does.
 
 ## Mercure Docker healthcheck
 
-The image's built-in health check targets the [transport readiness endpoint](../production/health-monitoring.md) at `localhost:2019/mercure/health/ready`.
+Images built from this repository's `Dockerfile` have a `HEALTHCHECK` on the [transport liveness endpoint](../production/health-monitoring.md) at `127.0.0.1:2019/mercure/health/live`; [Checks that replace instances](../production/health-monitoring.md#checks-that-replace-instances) explains why it is liveness. The upstream `dunglas/mercure` image probes `/mercure/health/ready`.
 
-For Compose, override or extend it:
+Plain Compose never replaces a container on an unhealthy status, and readiness gates startup ordering (`depends_on` with `condition: service_healthy`), so for Compose you can override the check with the readiness endpoint:
 
 ```yaml
 services:
@@ -107,7 +109,7 @@ services:
           "-q",
           "-O",
           "/dev/null",
-          "http://localhost:2019/mercure/health/ready",
+          "http://127.0.0.1:2019/mercure/health/ready",
         ]
       timeout: 5s
       retries: 5
@@ -172,6 +174,8 @@ Use a custom Caddyfile for multiple sites, reverse-proxy routes, or additional m
 Caddy emits structured logs. Inspect them with `docker logs` or your platform's logging service; Mercure log entries include fields such as `subscriber`, `update`, and `error`.
 
 Bump verbosity with `GLOBAL_OPTIONS=debug` (don't leave it on in prod: it logs update payloads).
+
+To change the access log format, mount a file and point `CADDY_ACCESS_LOG_FORMAT` at it (see [configuration](configuration.md#mercure-hub-environment-variables)).
 
 ## Mercure Docker image variants
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -797,6 +798,14 @@ func TestNewJWKSetKeyfunc(t *testing.T) {
 		assert.Contains(t, err.Error(), `"example.com"`)
 	})
 
+	t.Run("relative file URL", func(t *testing.T) {
+		for _, rawURL := range []string{"file:jwks.json", "file:./jwks.json", "file://./jwks.json"} {
+			_, err := newJWKSetKeyfunc(t.Context(), slog.New(slog.DiscardHandler), rawURL)
+			require.Error(t, err, rawURL)
+			assert.Contains(t, err.Error(), fmt.Sprintf("%q; the supported form is file:///absolute/path", rawURL))
+		}
+	})
+
 	t.Run("missing file", func(t *testing.T) {
 		_, err := newJWKSetKeyfunc(t.Context(), slog.New(slog.DiscardHandler), "file://"+filepath.Join(t.TempDir(), "absent.json"))
 		require.Error(t, err)
@@ -811,6 +820,236 @@ func TestNewJWKSetKeyfunc(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to parse JWK Set file")
 	})
+
+	t.Run("JWK Set file with no key", func(t *testing.T) {
+		empty := filepath.Join(t.TempDir(), "empty.json")
+		require.NoError(t, os.WriteFile(empty, []byte(`{"keys":[]}`), 0o600))
+
+		_, err := newJWKSetKeyfunc(t.Context(), slog.New(slog.DiscardHandler), "file://"+empty)
+		require.ErrorIs(t, err, errEmptyJWKSet)
+	})
+}
+
+// A JWK Set URL whose first fetch fails, or yields no key, must fail
+// Provision instead of starting a hub that rejects every token.
+func TestJWKSFirstFetchFailureFailsProvision(t *testing.T) {
+	t.Run("subscriber", func(t *testing.T) {
+		assertJWKSFirstFetchFailureFailsProvision(t, "subscriber", func(url string) string {
+			return fmt.Sprintf(`"issuers":[{"identifier":"https://example.com","publisher":{"jwt":{"key":"test-publisher-key","alg":"HS256"}},"subscriber":{"jwks_uri":%q}}]`, url)
+		})
+	})
+
+	t.Run("publisher", func(t *testing.T) {
+		assertJWKSFirstFetchFailureFailsProvision(t, "publisher", func(url string) string {
+			return fmt.Sprintf(`"issuers":[{"identifier":"https://example.com","publisher":{"jwks_uri":%q}}]`, url)
+		})
+	})
+}
+
+// assertJWKSFirstFetchFailureFailsProvision validates a hub whose role
+// ("publisher" or "subscriber") JWK Set is served by a local server:
+// provisioning succeeds when the server answers 200 with a valid set, and
+// fails on a 500 or on a 200 whose body holds no key. verifier returns the
+// hub's JSON verifier fields for a JWK Set URL.
+func assertJWKSFirstFetchFailureFailsProvision(t *testing.T, role string, verifier func(url string) string) {
+	t.Helper()
+
+	jwks, err := os.ReadFile("testdata/RS256.jwks.json")
+	require.NoError(t, err)
+
+	validate := func(status int, body []byte) error {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write(body)
+		}))
+		defer srv.Close()
+
+		raw := fmt.Sprintf(`{"admin":{"disabled":true,"config":{"persist":false}},"apps":{"http":{"servers":{"srv0":{"listen":["127.0.0.1:0"],"automatic_https":{"disable":true},"routes":[{"handle":[{"handler":"mercure","name":"jwks","anonymous":true,"transport":{"name":"local"},%s}]}]}}}}}`, verifier(srv.URL))
+
+		var cfg caddy.Config
+		require.NoError(t, json.Unmarshal([]byte(raw), &cfg))
+
+		return caddy.Validate(&cfg)
+	}
+
+	require.NoError(t, validate(http.StatusOK, jwks), "the same config with a reachable JWK Set must provision")
+	// The fetch failure itself, not only the empty set it would leave, must
+	// reach the operator.
+	err = validate(http.StatusInternalServerError, jwks)
+	require.ErrorContains(t, err, "failed to retrieve "+role+" JWK Set")
+	require.ErrorContains(t, err, "invalid HTTP status code: 500")
+
+	for _, body := range []string{`{}`, `{"keys":[]}`, `{"error":"server_error"}`} {
+		t.Run("200 "+body, func(t *testing.T) {
+			err := validate(http.StatusOK, []byte(body))
+			require.ErrorContains(t, err, "failed to retrieve "+role+" JWK Set")
+			require.ErrorContains(t, err, errEmptyJWKSet.Error())
+		})
+	}
+}
+
+// keyfunc refreshes a JWK Set every hour unless told otherwise; the hub asks
+// for 5 minutes.
+func TestJWKSOverride(t *testing.T) {
+	t.Parallel()
+
+	o := jwksOverride(slog.New(slog.DiscardHandler), &url.URL{Scheme: "https", Host: "example.com", Path: "/jwks"})
+
+	assert.Equal(t, 5*time.Minute, o.RefreshInterval)
+	assert.Equal(t, 10*time.Second, o.HTTPTimeout)
+	require.NotNil(t, o.NoErrorReturnFirstHTTPReq)
+	assert.False(t, *o.NoErrorReturnFirstHTTPReq)
+}
+
+// A failed refresh is logged through the hub's logger at Error, with the URL,
+// rather than through slog.Default.
+func TestJWKSRefreshFailureLoggedAtError(t *testing.T) {
+	jwks, err := os.ReadFile("testdata/RS256.jwks.json")
+	require.NoError(t, err)
+
+	var requests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			_, _ = w.Write(jwks)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+
+	m := &Mercure{logger: slog.New(slog.NewJSONHandler(&buf, nil))}
+
+	v, err := m.buildVerifier(t.Context(), VerifierConfig{JWKSURL: srv.URL + "/jwks"}, "subscriber")
+	require.NoError(t, err)
+
+	kf, ok := v.(mercure.KeyFunc)
+	require.True(t, ok)
+
+	// An unknown kid makes keyfunc refetch the set, which now fails.
+	_, err = kf.Keyfunc(&jwt.Token{Header: map[string]any{"kid": "unknown", "alg": "RS256"}, Method: jwt.SigningMethodRS256})
+	require.Error(t, err)
+	require.Equal(t, int32(2), requests.Load(), "the unknown kid must trigger a refetch")
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &entry), "exactly one log line expected, got %q", buf.String())
+	assert.Equal(t, "ERROR", entry["level"])
+	assert.Equal(t, srv.URL+"/jwks", entry["jwks_url"])
+}
+
+// A refresh cut short because the config is being unloaded (its context
+// cancelled) is not logged as a failure.
+func TestJWKSRefreshCancelledOnUnloadNotLogged(t *testing.T) {
+	jwks, err := os.ReadFile("testdata/RS256.jwks.json")
+	require.NoError(t, err)
+
+	var requests atomic.Int32
+
+	refetching := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			_, _ = w.Write(jwks)
+
+			return
+		}
+
+		// Hold the refetch until the client gives up.
+		close(refetching)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	var buf bytes.Buffer
+
+	m := &Mercure{logger: slog.New(slog.NewJSONHandler(&buf, nil))}
+
+	// configCtx stands for the Provision context, cancelled when Caddy unloads
+	// the config.
+	configCtx, unload := context.WithCancel(t.Context())
+	defer unload()
+
+	v, err := m.buildVerifier(configCtx, VerifierConfig{JWKSURL: srv.URL + "/jwks"}, "subscriber")
+	require.NoError(t, err)
+
+	kf, ok := v.(mercure.KeyFunc)
+	require.True(t, ok)
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := kf.Keyfunc(&jwt.Token{Header: map[string]any{"kid": "unknown", "alg": "RS256"}, Method: jwt.SigningMethodRS256})
+		done <- err
+	}()
+
+	<-refetching
+	unload()
+	require.Error(t, <-done)
+
+	assert.Empty(t, buf.String(), "a refresh cancelled by the unload must not be logged")
+}
+
+var errRefreshFailed = errors.New("connection reset")
+
+// The handler skips only cancellation, seen in the error or in its context;
+// any other failure, a timeout included, is logged, with the URL's password
+// redacted.
+func TestJWKSRefreshErrorHandler(t *testing.T) {
+	t.Parallel()
+
+	for name, tc := range map[string]struct {
+		ctx    string // "live", "cancelled" or "expired"
+		err    error
+		logged bool
+	}{
+		"cancelled error":   {"live", fmt.Errorf("refresh: %w", context.Canceled), false},
+		"cancelled context": {"cancelled", errRefreshFailed, false},
+		"timed out":         {"expired", fmt.Errorf("refresh: %w", context.DeadlineExceeded), true},
+		"failed":            {"live", errRefreshFailed, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+
+			switch tc.ctx {
+			case "cancelled":
+				c, cancel := context.WithCancel(ctx)
+				cancel()
+
+				ctx = c
+			case "expired":
+				c, cancel := context.WithDeadline(ctx, time.Now())
+				t.Cleanup(cancel)
+				<-c.Done()
+
+				ctx = c
+			}
+
+			var buf bytes.Buffer
+
+			u, err := url.Parse("https://user:secret@example.com/jwks")
+			require.NoError(t, err)
+
+			// Pass the URL as configured, as keyfunc does.
+			handler := jwksOverride(slog.New(slog.NewJSONHandler(&buf, nil)), u).RefreshErrorHandlerFunc(u.String())
+			handler(ctx, tc.err)
+
+			if !tc.logged {
+				assert.Empty(t, buf.String())
+
+				return
+			}
+
+			assert.Contains(t, buf.String(), `"level":"ERROR"`)
+			assert.Contains(t, buf.String(), `"jwks_url":"https://user:xxxxx@example.com/jwks"`)
+			assert.NotContains(t, buf.String(), "secret")
+		})
+	}
 }
 
 func TestNewJWKSetKeyfuncDoesNotFollowRedirects(t *testing.T) {
@@ -865,7 +1104,9 @@ func TestRefuseJWKSetRedirectNamesTarget(t *testing.T) {
 	assert.ErrorContains(t, err, server.URL+"/jwks/")
 }
 
-func TestBuildVerifierLogsJWKSetFetchFailure(t *testing.T) {
+// A redirect on the first fetch fails the verifier, naming the refused target,
+// rather than starting a hub without keys.
+func TestBuildVerifierFailsOnJWKSetRedirect(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -873,20 +1114,15 @@ func TestBuildVerifierLogsJWKSetFetchFailure(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	var logs bytes.Buffer
-
-	m := &Mercure{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	m := &Mercure{logger: slog.New(slog.DiscardHandler)}
 	ctx, cancel := context.WithCancel(t.Context())
 
 	defer cancel()
 
 	_, err := m.buildVerifier(ctx, VerifierConfig{JWKSURL: server.URL}, "publisher")
-	require.NoError(t, err)
-
-	assert.Contains(t, logs.String(), "level=ERROR")
-	assert.Contains(t, logs.String(), "Failed to fetch the JWK Set")
-	assert.Contains(t, logs.String(), "url="+server.URL)
-	assert.Contains(t, logs.String(), errJWKSetRedirect.Error())
+	require.ErrorIs(t, err, errJWKSetRedirect)
+	require.ErrorContains(t, err, "failed to retrieve publisher JWK Set")
+	require.ErrorContains(t, err, server.URL+"/elsewhere")
 }
 
 func TestNewJWKSetKeyfuncFetchesDirectHTTPResource(t *testing.T) {
@@ -1054,6 +1290,8 @@ func TestUnmarshalCaddyfileRejectsUnknownDirective(t *testing.T) {
 		{name: "typo of cors_origins", block: "cors_origin *", wantErr: `unknown mercure directive "cors_origin"`},
 		{name: "typo of publish_origins", block: "publish_origin *", wantErr: `unknown mercure directive "publish_origin"`},
 		{name: "wholly unknown directive", block: "totally_bogus foo bar", wantErr: `unknown mercure directive "totally_bogus"`},
+		// A typo in a security directive that parsed cleanly would fail open.
+		{name: "typo of require_claim_header", block: "requre_claim_header groups Group-ID", wantErr: `unknown mercure directive "requre_claim_header"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1264,26 +1502,26 @@ func TestLegacyJWTDirectivesRequireExplicitCompatibility(t *testing.T) {
 
 	for _, tc := range []struct {
 		name          string
-		mercure       Mercure
+		mercure       *Mercure
 		wantRejection bool
 	}{
 		{
 			name:          "legacy publisher key without compatibility mode",
-			mercure:       Mercure{PublisherJWT: JWTConfig{Key: "!ChangeMe!"}},
+			mercure:       &Mercure{PublisherJWT: JWTConfig{Key: "!ChangeMe!"}},
 			wantRejection: true,
 		},
 		{
 			name:          "legacy subscriber JWK Set without compatibility mode",
-			mercure:       Mercure{SubscriberJWKSURL: "https://example.com/jwks.json"},
+			mercure:       &Mercure{SubscriberJWKSURL: "https://example.com/jwks.json"},
 			wantRejection: true,
 		},
 		{
 			name:    "legacy publisher key with compatibility mode",
-			mercure: Mercure{PublisherJWT: JWTConfig{Key: "!ChangeMe!"}, ProtocolVersionCompatibility: 8},
+			mercure: &Mercure{PublisherJWT: JWTConfig{Key: "!ChangeMe!"}, ProtocolVersionCompatibility: 8},
 		},
 		{
 			name: "issuer block only",
-			mercure: Mercure{Issuers: []IssuerConfig{{
+			mercure: &Mercure{Issuers: []IssuerConfig{{
 				Identifier: "https://example.com",
 				Publisher:  VerifierConfig{JWT: JWTConfig{Key: "!ChangeMe!"}},
 			}}},
