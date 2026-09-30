@@ -168,3 +168,14 @@ func TestLocalTransportGetSubscribers(t *testing.T) {
 	assert.Contains(t, subscribers, &s1.Subscriber)
 	assert.Contains(t, subscribers, &s2.Subscriber)
 }
+
+// subscriberListed reports whether sl holds s.
+func subscriberListed(sl *SubscriberList, s *LocalSubscriber) (listed bool) {
+	sl.Walk(0, func(v *LocalSubscriber) bool {
+		listed = v == s
+
+		return !listed
+	})
+
+	return listed
+}

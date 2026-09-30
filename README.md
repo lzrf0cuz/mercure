@@ -30,9 +30,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License and Copyright
 
-See [license information](https://mercure.rocks/docs/hub/license).
+See [license information](https://mercure.rocks/docs/hub/license), [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
 
 ## Credits
 
 Created by [Kévin Dunglas](https://dunglas.fr). Graphic design by [Laury Sorriaux](https://github.com/ginifizz).
 Sponsored by [Les-Tilleuls.coop](https://les-tilleuls.coop).
+
+## Fork additions
+
+This fork adds an in-repo Redis/Valkey Streams transport at
+[`redistransport/`](redistransport/README.md). See its
+[Architecture](redistransport/README.md#architecture) section for diagrams
+of the publish/dispatch/presence subsystems and the categorized
+[Configuration Reference](redistransport/README.md#configuration-reference)
+for every Caddyfile directive.

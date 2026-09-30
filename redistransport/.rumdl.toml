@@ -1,0 +1,17 @@
+# rumdl config for the redistransport package (standalone).
+# Same rules as ../.rumdl.toml, because `rt:md:lint` runs rumdl from this directory.
+
+[global]
+disable = ["MD029", "MD036", "MD033", "MD004", "MD013", "MD060"]
+# releases/*.md are GitHub release-note bodies (fed to `gh release create
+# --notes-file`); the release title is the heading there, so MD041's "first
+# line must be an H1" does not apply. Path is package-relative because rt:md:lint
+# runs from this dir (the root .rumdl.toml uses redistransport/releases/*.md).
+exclude = ["releases/*.md"]
+
+[MD007]
+indent = 2
+style = "fixed"
+
+[MD026]
+punctuation = ".,;:!。，；:"

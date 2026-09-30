@@ -27,6 +27,8 @@ Visit `http://localhost:2019/debug/pprof/` for the full list. The ones that matt
 | `mutex`              | Mutex contention.                                                  |
 | `allocs`             | Past allocations (cumulative since start).                         |
 
+The `block` and `mutex` profiles stay empty: neither Caddy nor the hub enables recording with `runtime.SetBlockProfileRate` or `runtime.SetMutexProfileFraction`. Measure lock contention with `go test -bench . -mutexprofile mutex.out -blockprofile block.out`, which enables recording, or see it in an execution trace (`/debug/pprof/trace`, described below).
+
 ## Capture a CPU profile of the Mercure hub
 
 Capture a 30-second CPU profile and view it in the browser:

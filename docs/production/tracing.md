@@ -28,6 +28,21 @@ route {
 Exporters, endpoints (OTLP gRPC or HTTP), protocols, resource attributes, and propagators are all configured through the standard [`OTEL_*` environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/).
 Without a configured OpenTelemetry tracer provider, Mercure uses no-op spans and exports no traces.
 
+## Identity attributes
+
+Once the hub has verified a request's token and every [claim binding](../deployment/configuration.md#claim-bindings) that applies has passed, the handler span of each request (`mercure.publish`, `mercure.subscribe`, `mercure.subscriptions`) carries the caller's identity:
+
+| Attribute                 | Value                                      |
+| ------------------------- | ------------------------------------------ |
+| `user.id`                 | The token's `sub` claim                    |
+| `mercure.client_id`       | The token's `client_id` claim              |
+| `mercure.role`            | `publisher` or `subscriber`                |
+| `mercure.binding.<claim>` | The value the binding on `<claim>` matched |
+
+Anonymous requests, and requests rejected before verification completes (invalid token, failed binding), carry none of these, and a claim the token does not carry is left out. Values are sanitised and capped as for the [identity placeholders](../deployment/configuration.md#identity-placeholders).
+
+A request refused after verification still carries the identity, for example a `403` from the topic grants on a publish or subscription API request. For a publish, the attributes are on the HTTP handler's `mercure.publish` span only, not on the inner span of the same name that `Hub.Publish` starts.
+
 ## Next steps
 
 - [Health checks and monitoring](health-monitoring.md) for Prometheus metrics and health endpoints.

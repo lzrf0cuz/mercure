@@ -56,6 +56,8 @@ The `playground` directive turns on:
 
 Don't expose this to the internet.
 
+Images built from this repository run the production `Caddyfile` by default, which refuses `/.well-known/mercure/debug/*`. For the debug UI, run `mercure run -c /etc/caddy/local.Caddyfile`.
+
 ## Compose
 
 Save this as `compose.yaml`, replace the hostnames, then run `docker compose up -d`:
@@ -85,9 +87,9 @@ volumes:
 | Volume    | What's in it                                                   |
 | --------- | -------------------------------------------------------------- |
 | `/data`   | BoltDB history (`/data/caddy/mercure.db`) and Caddy TLS state. |
-| `/config` | Caddy autosaved configuration.                                 |
+| `/config` | Caddy's configuration directory (`XDG_CONFIG_HOME`).           |
 
-Persist `/data` to keep history and TLS state across restarts. `/config` stores Caddy's autosaved configuration.
+Persist `/data` to keep history and TLS state across restarts. `/config` is Caddy's configuration directory. The bundled Caddyfiles set `persist_config off`, so they write no `autosave.json` there, but a custom Caddyfile without that option does.
 
 ## Mercure Docker healthcheck
 
@@ -172,6 +174,8 @@ Use a custom Caddyfile for multiple sites, reverse-proxy routes, or additional m
 Caddy emits structured logs. Inspect them with `docker logs` or your platform's logging service; Mercure log entries include fields such as `subscriber`, `update`, and `error`.
 
 Bump verbosity with `GLOBAL_OPTIONS=debug` (don't leave it on in prod: it logs update payloads).
+
+To change the access log format, mount a file and point `CADDY_ACCESS_LOG_FORMAT` at it (see [configuration](configuration.md#mercure-hub-environment-variables)).
 
 ## Mercure Docker image variants
 
