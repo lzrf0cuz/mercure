@@ -1,0 +1,69 @@
+# grafana/dashboard-linter exclusions.
+#
+# The two rule lists below are intentionally identical: dashboard-linter
+# requires per-rule exclusion entries (no per-panel disable-multiple), so
+# every redis_exporter panel is listed once per disabled rule.
+#
+# Drift between this file and transport.json panel titles is detected by
+# TestDashboardLintExclusionsMatchRealPanels in dashboard_lint_test.go —
+# stale entries fail Tier 1 CI rather than silently no-op.
+exclusions:
+  target-job-rule:
+    reason: |
+      These panels query the redis_exporter sidecar's own Prometheus
+      scrape job (job="redis"), not the mercure hub `$job`. Adding
+      `$job` would change semantics and break the multi-stack
+      compose setup.
+      Re-evaluate if/when redis_exporter is scraped by the same
+      Prometheus job as the hub (then `$job` applies and the
+      exclusion can be removed).
+    entries:
+      - dashboard: Mercure Redis Transport
+        panel: Memory used vs max
+      - dashboard: Mercure Redis Transport
+        panel: Evictions / rejected connections
+      - dashboard: Mercure Redis Transport
+        panel: Commands per second
+      - dashboard: Mercure Redis Transport
+        panel: Connected clients
+      - dashboard: Mercure Redis Transport
+        panel: Keyspace hit ratio
+      - dashboard: Mercure Redis Transport
+        panel: Slow log length
+      - dashboard: Mercure Redis Transport
+        panel: Network throughput
+      - dashboard: Mercure Redis Transport
+        panel: CPU usage
+      - dashboard: Mercure Redis Transport
+        panel: Top 5 commands by avg latency
+      - dashboard: Mercure Redis Transport
+        panel: Memory fragmentation
+  target-instance-rule:
+    reason: |
+      redis_exporter scrapes exactly one target per backend; an
+      `$instance` filter would never narrow the query in a useful
+      way.
+      Re-evaluate if/when the hub-to-exporter mapping becomes
+      many-to-one or many-to-many (then `$instance` becomes
+      meaningful and the exclusion can be removed).
+    entries:
+      - dashboard: Mercure Redis Transport
+        panel: Memory used vs max
+      - dashboard: Mercure Redis Transport
+        panel: Evictions / rejected connections
+      - dashboard: Mercure Redis Transport
+        panel: Commands per second
+      - dashboard: Mercure Redis Transport
+        panel: Connected clients
+      - dashboard: Mercure Redis Transport
+        panel: Keyspace hit ratio
+      - dashboard: Mercure Redis Transport
+        panel: Slow log length
+      - dashboard: Mercure Redis Transport
+        panel: Network throughput
+      - dashboard: Mercure Redis Transport
+        panel: CPU usage
+      - dashboard: Mercure Redis Transport
+        panel: Top 5 commands by avg latency
+      - dashboard: Mercure Redis Transport
+        panel: Memory fragmentation

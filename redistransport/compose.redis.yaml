@@ -1,0 +1,48 @@
+# Docker Compose for the Redis transport — local dev + conformance tests.
+#
+# Includes the shared RedisInsight UI stack (compose.redisinsight.yaml) so
+# the dev experience matches compose.valkey.yaml. The conformance pipeline
+# does not require the UI but starting it alongside the data backend is
+# harmless (UI startup is independent of the test run).
+#
+# Usage:
+#   docker compose -f redistransport/compose.redis.yaml up -d
+#   # then run the hub and conformance tests (see Taskfile tasks)
+#
+# Services:
+#   redis         — Redis 7 server on localhost:6379
+#   redisinsight  — Web UI on http://localhost:5540 (from compose.redisinsight.yaml)
+
+include:
+  - compose.redisinsight.yaml
+  - compose.observability.yaml
+
+name: mercure-redis
+
+services:
+  redis:
+    container_name: mercure-redis
+    image: ${REDIS_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # Override the redisinsight service from compose.redisinsight.yaml to
+  # add a backend dependency — UI starts only after redis is healthy.
+  redisinsight:
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Override the bootstrap sidecar to point at this stack's backend.
+  redisinsight-bootstrap:
+    environment:
+      BACKEND_HOST: redis
+      BACKEND_NAME: Local Redis

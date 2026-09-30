@@ -4,8 +4,14 @@
   *
   * Available environment variables (all optional):
   *   - HUB_URL: the URL of the hub to test
-  *   - JWT: the JWT to use for authenticating the publisher, fallbacks to JWT
-  *     if not set and PRIVATE_UPDATES set
+  *   - JWT: the JWT to use for authenticating the publisher
+  *   - SUBSCRIBER_JWT: the JWT to use for authenticating the subscriber,
+  *     fallbacks to JWT if not set and PRIVATE_UPDATES set
+  *   - SUBSCRIBER_HEADERS: extra request headers sent on subscribe requests
+  *     only, as `Name: value` pairs separated by newlines or `;`. Must not
+  *     name Authorization (use SUBSCRIBER_JWT / JWT)
+  *   - PUBLISHER_HEADERS: extra request headers sent on publish requests only,
+  *     same format. Must not name Authorization (use JWT)
   *   - INITIAL_SUBSCRIBERS: the number of concurrent subscribers initially
   *     connected
   *   - SUBSCRIBERS_RATE_FROM: minimum rate (per second) of additional
@@ -18,6 +24,11 @@
   *   - CONNECTION_DURATION: duration of subscribers' connection
   *   - RANDOM_CONNECTION_DURATION: to randomize the connection duration (will
   *     longs CONNECTION_DURATION at max)
+  *   - PRIVATE_UPDATES: send private updates with random topics (default false)
+  *   - SUBSCRIBE_PARAM: overrides the subscribe query parameter, e.g.
+  *     "match=https://example.com"
+  *   - PUBLISH_TOPIC: overrides the published topic; it must match the
+  *     subscriber's matcher
   */
 
 package mercure
@@ -26,6 +37,52 @@ import io.gatling.core.Predef._
 import io.gatling.http.Predef._
 import scala.concurrent.duration._
 import scala.util.Properties
+
+/** Parser for the SUBSCRIBER_HEADERS and PUBLISHER_HEADERS environment
+  * variables.
+  */
+object RequestHeadersParser {
+
+  /** Parses `Name: value` pairs separated by newlines or `;`. Each pair is
+    * split on its first `:`; names and values are trimmed; blank entries are
+    * skipped.
+    *
+    * Called at simulation start, so a malformed entry or an Authorization
+    * header fails fast with an IllegalArgumentException naming `varName` and
+    * the 1-based position of the entry among the non-blank entries. The entry
+    * text is never echoed, as it may hold a token. `tokenSource` is the clause
+    * appended to the Authorization error, saying where the token comes from
+    * instead (e.g. "the publisher token comes from JWT").
+    */
+  def parse(
+      varName: String,
+      tokenSource: String,
+      raw: String
+  ): List[(String, String)] = {
+    raw
+      .split("[\\r\\n;]")
+      .toList
+      .filter(_.trim.nonEmpty)
+      .zipWithIndex
+      .map { case (entry, i) =>
+        val idx = entry.indexOf(':')
+        val name = if (idx < 0) "" else entry.substring(0, idx).trim
+        if (name.isEmpty) {
+          throw new IllegalArgumentException(
+            "Invalid " + varName + " entry " + (i + 1) +
+              ": expected 'Name: value'"
+          )
+        }
+        if (name.equalsIgnoreCase("Authorization")) {
+          throw new IllegalArgumentException(
+            "Invalid " + varName + " entry " + (i + 1) +
+              ": Authorization is not allowed; " + tokenSource
+          )
+        }
+        (name, entry.substring(idx + 1).trim)
+      }
+  }
+}
 
 class LoadTest extends Simulation {
 
@@ -91,6 +148,20 @@ class LoadTest extends Simulation {
     */
   val PublishTopic = Properties.envOrElse("PUBLISH_TOPIC", null)
 
+  /** Extra headers added to subscribe requests only. */
+  val SubscriberHeaders = RequestHeadersParser.parse(
+    "SUBSCRIBER_HEADERS",
+    "the subscriber token comes from SUBSCRIBER_JWT / JWT",
+    Properties.envOrElse("SUBSCRIBER_HEADERS", "")
+  )
+
+  /** Extra headers added to publish requests only. */
+  val PublisherHeaders = RequestHeadersParser.parse(
+    "PUBLISHER_HEADERS",
+    "the publisher token comes from JWT",
+    Properties.envOrElse("PUBLISHER_HEADERS", "")
+  )
+
   val rnd = new scala.util.Random
 
   /** Subscriber test as a function to handle conditional Authorization header
@@ -115,6 +186,10 @@ class LoadTest extends Simulation {
       requestBuilder = requestBuilder.header("Authorization", "Bearer " + Jwt)
     }
 
+    SubscriberHeaders.foreach { case (name, value) =>
+      requestBuilder = requestBuilder.header(name, value)
+    }
+
     requestBuilder.await(10)(
       sse.checkMessage("Check content").check(regex("""(.*)Hi(.*)"""))
     )
@@ -136,14 +211,15 @@ class LoadTest extends Simulation {
     data = data + ("private" -> "true")
   }
 
-  val scenarioPublish = scenario("Publish")
-    .exec(
-      http("Publish")
-        .post("")
-        .header("Authorization", "Bearer " + Jwt)
-        .formParamMap(data)
-        .check(status.is(200))
-    )
+  val publishRequest = PublisherHeaders.foldLeft(
+    http("Publish")
+      .post("")
+      .header("Authorization", "Bearer " + Jwt)
+      .formParamMap(data)
+      .check(status.is(200))
+  ) { case (request, (name, value)) => request.header(name, value) }
+
+  val scenarioPublish = scenario("Publish").exec(publishRequest)
 
   val scenarioSubscribe = scenario("Subscribe")
     .exec(

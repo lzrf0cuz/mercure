@@ -20,15 +20,29 @@ All health endpoints live on the Caddy admin API (default `localhost:2019`):
 
 The bundled BoltDB and local transports do not implement remote dependency checks, so their probes return `200`. This does not verify disk capacity or end-to-end delivery. Shared transports can implement their own readiness and liveness checks.
 
+The `Caddyfile` and `local.Caddyfile` bundled with this repository's images also reverse-proxy `/mercure/health/*` from the public listener to the loopback admin API, so `https://<host>/mercure/health/ready` works from outside the container. Only these paths reach admin; the proxy sends `Host 127.0.0.1:2019`, which admin's origin check accepts.
+
 ## Why Mercure has two health endpoints
 
 Readiness can fail during a temporary transport outage. Liveness lets a transport distinguish temporary failures from conditions that require a restart; the exact checks depend on the transport.
 
 Restarting a hub during a temporary backend outage also disconnects its subscribers. Configure restart thresholds to allow the transport time to recover.
 
+### Checks that replace instances
+
+Point any check whose failure replaces the instance at liveness, not readiness. On Amazon ECS this covers the load balancer target group health check as well as the container health check: the service scheduler replaces a task that fails either one, and when the replacement is also unhealthy it may stop the original task. A readiness check there turns an outage of a shared backend into the replacement of every hub.
+
+Docker Swarm replaces a task whose container fails the image `HEALTHCHECK`, so images built from this repository's `Dockerfile` probe `/mercure/health/live`; the upstream `dunglas/mercure` image probes `/mercure/health/ready`. Use readiness only where a failure removes the instance from routing and nothing else, such as a Kubernetes `readinessProbe`.
+
+The Redis transport fails liveness only when the transport is closed or its stream listener has exited. Redis errors, a failing `PING` and a stalled listener fail readiness only, because they affect every hub sharing the Redis deployment and a restart does not fix them.
+
+A hub that is the only one to lose its backend connection stays live and keeps receiving traffic; alert on readiness for that case. With the Redis transport, alert on the `mercure_redis_ready` gauge, which reads the readiness check at scrape time: when the load balancer probes `/mercure/health/live`, nothing requests `/mercure/health/ready`.
+
 ## Probing from outside the container
 
-The admin API binds to `localhost:2019` for security. That means standard `httpGet` probes, which run from outside the container, can't reach it. Use `exec` probes instead:
+The admin API binds to `localhost:2019` for security. That means standard `httpGet` probes, which run from outside the container, can't reach it. Use `exec` probes instead (or, with the bundled Caddyfiles, probe the proxied `/mercure/health/*` path on the public listener).
+
+The probes use `127.0.0.1`, not `localhost`: the admin API listens on IPv4 loopback, and BusyBox `wget` in the Alpine-based image resolves `localhost` to `::1` first without falling back to IPv4.
 
 ```yaml
 readinessProbe:
@@ -39,7 +53,7 @@ readinessProbe:
         "-q",
         "-O",
         "/dev/null",
-        "http://localhost:2019/mercure/health/ready",
+        "http://127.0.0.1:2019/mercure/health/ready",
       ]
   initialDelaySeconds: 10
   periodSeconds: 10
@@ -51,7 +65,7 @@ livenessProbe:
         "-q",
         "-O",
         "/dev/null",
-        "http://localhost:2019/mercure/health/live",
+        "http://127.0.0.1:2019/mercure/health/live",
       ]
   initialDelaySeconds: 30
   periodSeconds: 30
@@ -68,7 +82,7 @@ healthcheck:
       "-q",
       "-O",
       "/dev/null",
-      "http://localhost:2019/mercure/health/ready",
+      "http://127.0.0.1:2019/mercure/health/ready",
     ]
   timeout: 5s
   retries: 5
@@ -112,26 +126,30 @@ Metrics live on the admin API at `/metrics`. The hub exposes Caddy's built-in me
 
 When the same Caddy instance serves several hubs, these series are summed across all of them. Each of them also has a per-hub counterpart, `mercure_hub_subscribers_connected`, `mercure_hub_subscribers_total`, `mercure_hub_updates_total` and `mercure_hub_subscriptions_rejected_total`, labeled with `hub` set to the hub's `name` (`default` for the unnamed hub). Hubs sharing the same `name`, including a hub explicitly named `default` and the unnamed hub, share the same per-hub series. Don't sum `mercure_*` and `mercure_hub_*` together: that counts every event twice.
 
+The bundled `Caddyfile` and `local.Caddyfile` also serve `/metrics` on a plain-HTTP `:9091` listener, which the image exposes and the repository's Prometheus config scrapes. It has no TLS or authentication: keep it off the public network. It does not depend on the global `metrics` option (the `metrics` handler serves the configuration's registry, so the `mercure_*` series are there); Caddy's HTTP request metrics (`caddy_http_*`) need the option.
+
+See the [metrics reference](metrics.md) for every hub metric, its type and labels, rejection status mappings, and the provisioned Grafana dashboard.
+
 Plus standard Caddy metrics: request counts, latencies, in-flight requests, certificate expiry. See the [Caddy metrics docs](https://caddyserver.com/docs/metrics).
 
 ## Useful alerts for the Mercure hub
 
 Set thresholds from your workload and availability targets:
 
-| Alert               | Condition                                                                                          |
-| ------------------- | -------------------------------------------------------------------------------------------------- |
-| Hub down            | Prometheus `up` is `0` for the configured alert window.                                            |
-| Reconnect storm     | `rate(mercure_subscribers_total[5m])` > 10x steady state.                                          |
-| Transport unhealthy | Readiness endpoint returning 503.                                                                  |
-| Slow dispatch       | Publish (`POST`) request duration p99 exceeds your target; exclude long-lived `GET` subscriptions. |
-| Cert expiry         | Less than 14 days.                                                                                 |
+| Alert               | Condition                                                                                                       |
+| ------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Hub down            | Prometheus `up` is `0` for the configured alert window.                                                         |
+| Reconnect storm     | `rate(mercure_subscribers_total[5m])` > 10x steady state.                                                       |
+| Transport unhealthy | Readiness endpoint returning 503. With the Redis transport, `mercure_redis_ready` is `0`, which needs no probe. |
+| Slow dispatch       | Publish (`POST`) request duration p99 exceeds your target; exclude long-lived `GET` subscriptions.              |
+| Cert expiry         | Less than 14 days.                                                                                              |
 
 ## Mercure Grafana dashboards
 
-A reasonable Grafana panel set:
+The repository provisions a hub dashboard, `grafana/dashboards/hub.json`, in the Grafana started by the root compose stack (`task up`) and by `task dev:full`; see the [metrics reference](metrics.md#dashboard). To build your own, a reasonable Grafana panel set:
 
 - **Connections**: `mercure_subscribers_connected` per pod, stacked.
-- **Publish rate**: `rate(mercure_updates_total[1m])`, with publish error responses from HTTP metrics or logs overlaid.
+- **Publish rate**: `rate(mercure_updates_total[1m])`, with `rate(mercure_updates_failed_total[1m])` by `reason` overlaid.
 - **Reconnect rate**: `rate(mercure_subscribers_total[1m])`. Compare spikes with deployment and proxy events.
 - **Transport health**: readiness endpoint state (a synthetic probe writing to a metric).
 - **Latency**: request duration histograms from Caddy.

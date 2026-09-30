@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # The redistransport dev loop runs the hub natively (`task dev:redis` or
+  # `task go:run:redis` from the repo root), so Prometheus scrapes the host
+  # through Docker's host bridge alias.
+  #
+  # `host.docker.internal` resolves on Docker Desktop (macOS/Windows),
+  # OrbStack, and Rancher Desktop. On bare Linux, override the target
+  # with a host gateway alias declared at the service level (see
+  # compose.observability.yaml).
+  - job_name: mercure
+    static_configs:
+      - targets: ['host.docker.internal:9091']
+
+  # Redis-server-side metrics via oliver006/redis_exporter, gated behind
+  # the `metrics` Compose profile. Prometheus reaches `redis_exporter` on the
+  # project's default network; the exporter connects to Redis/Valkey on
+  # `host.docker.internal:6379`.
+  - job_name: redis
+    static_configs:
+      - targets: ['redis_exporter:9121']

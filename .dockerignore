@@ -1,0 +1,19 @@
+# The build compiles the whole module from the context (Dockerfile `COPY ./ ./`),
+# so exclude only build artifacts + what the compile never reads. `-buildvcs=false`
+# makes `.git/` unused. The `.*` rule below also keeps `.env*` secrets out of the
+# daemon and the layers.
+# Build, test and tooling artifacts, and local runtime state.
+bin/
+data/
+*.db
+coverage.out
+coverage.html
+conformance-tests/
+# Root-level dot-files and dot-directories (VCS, env files, tool, editor and cache state, CI config); the build reads none.
+.*
+# Editor junk.
+*.iml
+*.swp
+# Non-compiled trees the hub binary build never reads.
+gatling/
+charts/

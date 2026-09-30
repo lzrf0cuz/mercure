@@ -239,6 +239,104 @@ func TestWithIssuersRejectsMissingAlgorithm(t *testing.T) {
 	require.ErrorIs(t, o(&opt{}), ErrMissingAlgorithm)
 }
 
+// nopTransport is a Transport whose methods all return nil, embedded by test
+// transports that need extra interfaces.
+type nopTransport struct{}
+
+func (nopTransport) Dispatch(_ context.Context, _ *Update) error                  { return nil }
+func (nopTransport) AddSubscriber(_ context.Context, _ *LocalSubscriber) error    { return nil }
+func (nopTransport) RemoveSubscriber(_ context.Context, _ *LocalSubscriber) error { return nil }
+func (nopTransport) Close(_ context.Context) error                                { return nil }
+
+// codecRecordingTransport records the codec SetCodec received and how many times
+// it was called.
+type codecRecordingTransport struct {
+	nopTransport
+
+	codecSetTo Codec
+	setCalls   int
+}
+
+func (t *codecRecordingTransport) SetCodec(c Codec) {
+	t.codecSetTo = c
+	t.setCalls++
+}
+
+var (
+	_ Transport      = nopTransport{}
+	_ Transport      = (*codecRecordingTransport)(nil)
+	_ TransportCodec = (*codecRecordingTransport)(nil)
+)
+
+// TestNewHubWithCodecSetsCodecOnTransport: with WithCodec and a TransportCodec
+// transport, NewHub calls SetCodec exactly once with the configured codec.
+func TestNewHubWithCodecSetsCodecOnTransport(t *testing.T) {
+	t.Parallel()
+
+	transport := &codecRecordingTransport{}
+	codec := &JSONCodec{}
+
+	h, err := NewHub(t.Context(), WithTransport(transport), WithCodec(codec))
+	require.NoError(t, err)
+	require.NotNil(t, h)
+
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	assert.Equal(t, 1, transport.setCalls,
+		"SetCodec must be invoked exactly once at hub init when transport implements TransportCodec")
+	assert.Same(t, Codec(codec), transport.codecSetTo,
+		"the codec passed to WithCodec must reach the transport verbatim")
+}
+
+// TestNewHubNoCodecSkipsTransportCodec: without WithCodec, NewHub does not call
+// SetCodec, even on a TransportCodec transport.
+func TestNewHubNoCodecSkipsTransportCodec(t *testing.T) {
+	t.Parallel()
+
+	transport := &codecRecordingTransport{}
+
+	h, err := NewHub(t.Context(), WithTransport(transport))
+	require.NoError(t, err)
+	require.NotNil(t, h)
+
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	assert.Equal(t, 0, transport.setCalls,
+		"no WithCodec option: SetCodec must not be invoked even on a TransportCodec-implementing transport")
+}
+
+// TestNewHubWithCodecNil: WithCodec(nil) is equivalent to omitting the option, so
+// SetCodec is not called.
+func TestNewHubWithCodecNil(t *testing.T) {
+	t.Parallel()
+
+	transport := &codecRecordingTransport{}
+
+	h, err := NewHub(t.Context(), WithTransport(transport), WithCodec(nil))
+	require.NoError(t, err)
+	require.NotNil(t, h)
+
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	assert.Equal(t, 0, transport.setCalls,
+		"WithCodec(nil) must be equivalent to omitting the option: no SetCodec call, no panic")
+}
+
+// TestNewHubWithCodecSkipsTransportWithoutCodec: with WithCodec and a transport
+// that does not implement TransportCodec (LocalTransport, Bolt), NewHub succeeds.
+func TestNewHubWithCodecSkipsTransportWithoutCodec(t *testing.T) {
+	t.Parallel()
+
+	transport := &nopTransport{}
+	codec := &JSONCodec{}
+
+	h, err := NewHub(t.Context(), WithTransport(transport), WithCodec(codec))
+	require.NoError(t, err)
+	require.NotNil(t, h)
+
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+}
+
 func TestWithDebug(t *testing.T) {
 	op := &opt{}
 
