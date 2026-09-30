@@ -11,6 +11,16 @@ Use the Go `pprof` endpoints to investigate CPU, memory, and goroutine use. Comp
 
 Caddy exposes `pprof` at `http://localhost:2019/debug/pprof/` while its admin API is enabled. The `debug` logging option is not required. Reach the loopback endpoint through a local command, `docker exec`, or `kubectl exec`.
 
+The `go tool pprof <URL>` examples below need Go and a reachable admin port. The image has no Go toolchain, and in a container the admin API listens on the container's loopback only:
+
+- Kubernetes: run `kubectl port-forward pod/<pod> 2019:2019`, then run the examples unchanged on your machine.
+- Docker: save the profile with `curl` inside the container, then open the file on the host:
+
+  ```console
+  docker exec <container> curl -sf http://localhost:2019/debug/pprof/heap > heap.pb.gz
+  go tool pprof -http=:8080 heap.pb.gz
+  ```
+
 Keep the admin API private. Profiles and goroutine dumps can disclose application details, and the admin API also permits configuration changes.
 
 ## What's available
@@ -26,6 +36,8 @@ Visit `http://localhost:2019/debug/pprof/` for the full list. The ones that matt
 | `block`              | Goroutines blocked on synchronization.                             |
 | `mutex`              | Mutex contention.                                                  |
 | `allocs`             | Past allocations (cumulative since start).                         |
+
+The `block` and `mutex` profiles stay empty: neither Caddy nor the hub enables recording with `runtime.SetBlockProfileRate` or `runtime.SetMutexProfileFraction`. Measure lock contention with `go test -bench . -mutexprofile mutex.out -blockprofile block.out`, which enables recording, or see it in an execution trace (`/debug/pprof/trace`, described below).
 
 ## Capture a CPU profile of the Mercure hub
 
@@ -48,9 +60,9 @@ The `inuse_space` view shows current live memory. The `alloc_space` view shows c
 Sustained memory growth under comparable load can indicate a leak or retained data. Capture two heap snapshots and compare them:
 
 ```console
-curl -s http://localhost:2019/debug/pprof/heap > heap1.pb.gz
+curl -sf http://localhost:2019/debug/pprof/heap > heap1.pb.gz
 sleep 300
-curl -s http://localhost:2019/debug/pprof/heap > heap2.pb.gz
+curl -sf http://localhost:2019/debug/pprof/heap > heap2.pb.gz
 go tool pprof -http=:8080 -base heap1.pb.gz heap2.pb.gz
 ```
 
@@ -59,7 +71,7 @@ go tool pprof -http=:8080 -base heap1.pb.gz heap2.pb.gz
 A goroutine dump is the cheapest way to diagnose "the hub is wedged":
 
 ```console
-curl -s "http://localhost:2019/debug/pprof/goroutine?debug=2" > goroutines.txt
+curl -sf "http://localhost:2019/debug/pprof/goroutine?debug=2" > goroutines.txt
 ```
 
 Look for:
@@ -73,22 +85,35 @@ Look for:
 The `goroutine` profile lists every live goroutine, so a leak hides among the
 per-subscriber goroutines a healthy hub is supposed to have. The `goroutineleak`
 profile reports only goroutines the garbage collector proved can never be
-unblocked, which is the shorter list worth reading:
+unblocked. Read this shorter list first:
 
 ```console
-curl -s "http://localhost:2019/debug/pprof/goroutineleak?debug=2" > leaks.txt
+curl -sf "http://localhost:2019/debug/pprof/goroutineleak?debug=1" > leaks.txt
 ```
 
-An empty profile means no leak was detected. Goroutines blocked on a channel or
-mutex still reachable from a global variable can escape detection, so an empty
-result is not a proof of absence: fall back to the goroutine dump above.
+An idle hub already reports `total 1`: one entry with no stack. The standard
+Caddy build, without Mercure, reports the same:
+
+```text
+goroutineleak profile: total 1
+1 @
+#	0x0
+```
+
+Read the profile once on an idle hub as a baseline, and compare later reads
+against it. A new entry with stack frames is a leak candidate.
+
+A total at or below the baseline does not rule out a leak. A blocked goroutine
+escapes detection when its channel or mutex is still reachable from a global
+variable or from the stack of a goroutine that can still run. If you suspect a
+leak anyway, use the goroutine dump above.
 
 ## Capture an execution trace of the Mercure hub
 
 For latency investigations, capture an execution trace:
 
 ```console
-curl -s "http://localhost:2019/debug/pprof/trace?seconds=10" -o trace.out
+curl -sf "http://localhost:2019/debug/pprof/trace?seconds=10" -o trace.out
 go tool trace trace.out
 ```
 

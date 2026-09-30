@@ -1,12 +1,11 @@
 package caddy
 
 import (
-	"bytes"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -18,6 +17,28 @@ func init() { //nolint:gochecknoinits
 	caddy.RegisterModule(&Bolt{})
 }
 
+// boltTransportKey identifies a pooled Bolt transport by its database file,
+// not by its options: Caddy provisions a reloaded config before it cleans up
+// the old one, so a reload must reuse the transport that holds the file.
+type boltTransportKey struct {
+	path string
+	hub  string
+}
+
+// boltOptions are the options a pooled Bolt transport was created with.
+type boltOptions struct {
+	bucketName              string
+	size                    uint64
+	cleanupFrequency        float64
+	subscriberListCacheSize int
+}
+
+type boltDestructor struct {
+	TransportDestructor[*mercure.BoltTransport]
+
+	options boltOptions
+}
+
 type Bolt struct {
 	Path             string   `json:"path,omitempty"`
 	BucketName       string   `json:"bucket_name,omitempty"`
@@ -25,7 +46,7 @@ type Bolt struct {
 	CleanupFrequency *float64 `json:"cleanup_frequency,omitempty"`
 
 	transport    *mercure.BoltTransport
-	transportKey string
+	transportKey boltTransportKey
 }
 
 // CaddyModule returns the Caddy module information.
@@ -48,41 +69,77 @@ func (b *Bolt) Provision(ctx caddy.Context) error {
 		b.Path = filepath.Join(caddy.AppDataDir(), "mercure.db")
 	}
 
-	var key bytes.Buffer
-	if err := gob.NewEncoder(&key).Encode(b); err != nil {
+	// Abs also cleans the path, so "./x", "x" and "/cwd/x" share a key.
+	path, err := filepath.Abs(b.Path)
+	if err != nil {
 		return err
 	}
 
-	key.WriteString(hubName(ctx))
+	b.transportKey = boltTransportKey{path, hubName(ctx)}
 
-	b.transportKey = key.String()
+	bucketName := b.BucketName
+	if bucketName == "" {
+		bucketName = mercure.BoltDefaultBucketName
+	}
 
-	destructor, _, err := TransportUsagePool.LoadOrNew(b.transportKey, func() (caddy.Destructor, error) {
+	options := boltOptions{bucketName, b.Size, b.cleanupFrequency(), ctx.Value(SubscriberListCacheSizeContextKey).(int)}
+
+	destructor, loaded, err := TransportUsagePool.LoadOrNew(b.transportKey, func() (caddy.Destructor, error) {
 		t, err := mercure.NewBoltTransport(
-			mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
+			mercure.NewSubscriberList(options.subscriberListCacheSize),
 			ctx.Slogger(),
 			b.Path,
-			b.BucketName,
-			b.Size,
-			b.cleanupFrequency(),
+			options.bucketName,
+			options.size,
+			options.cleanupFrequency,
 		)
 		if errors.Is(err, bolterrors.ErrTimeout) {
-			return nil, fmt.Errorf("%q is already open, give each hub its own path: %w", b.Path, err)
+			return nil, fmt.Errorf("%q is already open: give each hub its own path, and restart Caddy to rename a hub (a reload keeps the open database): %w", b.Path, err)
 		}
 
 		if err != nil {
 			return nil, err
 		}
 
-		return TransportDestructor[*mercure.BoltTransport]{Transport: t}, nil
+		return boltDestructor{TransportDestructor[*mercure.BoltTransport]{Transport: t}, options}, nil
 	})
 	if err != nil {
 		return err
 	}
 
-	b.transport = destructor.(TransportDestructor[*mercure.BoltTransport]).Transport
+	// On failure, Caddy calls Cleanup, which releases the pooled transport.
+	pooled := destructor.(boltDestructor)
+	if diffs := pooled.options.diff(options); loaded && len(diffs) > 0 {
+		return fmt.Errorf("%q is %w (%s): restart Caddy to change them; a reload keeps the open database", b.Path, errTransportOptionsChanged, strings.Join(diffs, ", "))
+	}
+
+	b.transport = pooled.Transport
 
 	return nil
+}
+
+// diff lists the options that differ between o, the options the open
+// transport was created with, and n.
+func (o boltOptions) diff(n boltOptions) []string {
+	var diffs []string
+
+	if o.bucketName != n.bucketName {
+		diffs = append(diffs, fmt.Sprintf("bucket_name %q -> %q", o.bucketName, n.bucketName))
+	}
+
+	if o.size != n.size {
+		diffs = append(diffs, fmt.Sprintf("size %d -> %d", o.size, n.size))
+	}
+
+	if o.cleanupFrequency != n.cleanupFrequency {
+		diffs = append(diffs, fmt.Sprintf("cleanup_frequency %v -> %v", o.cleanupFrequency, n.cleanupFrequency))
+	}
+
+	if o.subscriberListCacheSize != n.subscriberListCacheSize {
+		diffs = append(diffs, fmt.Sprintf("subscriber_list_cache_size %d -> %d", o.subscriberListCacheSize, n.subscriberListCacheSize))
+	}
+
+	return diffs
 }
 
 //nolint:wrapcheck

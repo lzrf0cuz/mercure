@@ -1,7 +1,6 @@
 package mercure
 
 import (
-	"embed"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,11 +10,6 @@ import (
 )
 
 const hubLink = "<" + defaultHubURL + `>; rel="mercure"`
-
-// debuggerContent is our static web server content.
-//
-//go:embed public
-var debuggerContent embed.FS
 
 // Playground exposes INSECURE endpoints to test discovery and authorization mechanisms.
 // Add a query parameter named "body" to define the content to return in the response's body.
