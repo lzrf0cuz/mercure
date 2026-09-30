@@ -1,57 +1,180 @@
-# Learn how to configure the Mercure.rocks Hub on https://mercure.rocks/docs/hub/config
+# Mercure Hub - Production Configuration (Direct Deployment)
+# Caddy manages TLS directly
+# TLS is only enabled on the main server — :9091 (metrics) is plain HTTP, admin is loopback-only
+# https://mercure.rocks/docs/hub/config
+# https://caddyserver.com/docs/caddyfile
 {
+	# Bind admin to loopback only. The Dockerfile HEALTHCHECK probes
+	# /mercure/health/ready on this listener for transport-aware health.
+	# Caddy's default origin check rejects non-loopback origins with 403,
+	# so this is functionally equivalent to admin off for external callers
+	# while keeping in-container health endpoints reachable.
+	admin localhost:2019
+
+	# Served with `-c <file>` and never `--resume`: autosave.json would be
+	# written and never read, and it breaks a read-only root filesystem.
+	persist_config off
+
+	# Shutdown waits up to 10s for open requests, SSE streams included, then closes them.
+	grace_period 10s
+
 	{$GLOBAL_OPTIONS}
+}
+
+# Trusted issuer, in the two shapes a deployment can verify tokens with.
+# The mercure block below imports one, chosen by MERCURE_ISSUER_MODE:
+#   keys (default) - verification secrets/keys from MERCURE_{PUBLISHER,SUBSCRIBER}_JWT_{KEY,ALG}
+#   jwks           - JWK Set URLs from MERCURE_{PUBLISHER,SUBSCRIBER}_JWKS_URI (file:// accepted)
+# {env.VAR} is the runtime placeholder resolved at module Provision time
+# (see populateJWTConfig in caddy/mercure.go) — survives multi-line PEM keys
+# that {$VAR} (parse-time substitution) would mangle by splitting them across
+# Caddyfile directives.
+(mercure_issuer_keys) {
+	issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
+		publisher {
+			jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+		}
+		subscriber {
+			jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+		}
+	}
+}
+
+(mercure_issuer_jwks) {
+	issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
+		publisher {
+			jwks_uri {$MERCURE_PUBLISHER_JWKS_URI}
+		}
+		subscriber {
+			jwks_uri {$MERCURE_SUBSCRIBER_JWKS_URI}
+		}
+	}
+}
+
+# Prometheus metrics on plain HTTP :9091; keep this port off the public network.
+:9091 {
+	handle /metrics {
+		metrics
+	}
+	handle {
+		respond 404
+	}
 }
 
 {$CADDY_EXTRA_CONFIG}
 
 {$SERVER_NAME:localhost} {
-	encode zstd gzip
+	# HSTS: tell browsers to always use HTTPS
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
 
-	mercure {
-		# Trusted issuer: binds the iss claim access tokens must carry (RFC 9068)
-		# to its verification keys. The localhost default suits local development
-		# only. In production set MERCURE_TRUSTED_ISSUERS to the stable identifier
-		# of your token issuer (your app's URL for self-issued tokens). Add
-		# `authorization_server` inside the block to advertise it in the protected
-		# resource metadata, or add more `issuer` blocks via MERCURE_EXTRA_DIRECTIVES.
-		issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
-			# Publisher JWT key
-			publisher {
-				jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
-			}
-			# Subscriber JWT key
-			subscriber {
-				jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+	log {
+		format filter {
+			fields {
+				request>uri query {
+					replace authorization REDACTED
+					replace jwt REDACTED
+				}
 			}
 		}
-		# The hub derives its public URL, the OAuth 2.0 resource identifier (the
-		# audience access tokens must carry) and the RFC 9728 metadata from each
-		# request, so it works unchanged behind one or several domains. A catch-all
-		# SERVER_NAME (e.g. `:80`) accepts any client-chosen Host: add `public_urls`.
-		# Advanced (via MERCURE_EXTRA_DIRECTIVES): pin one canonical audience
-		# across every domain with `resource_identifier https://…/.well-known/mercure`,
-		# or, on a catch-all site block, restrict the public URLs the hub answers
-		# on with `public_urls https://a.example.com https://b.example.com`.
-		# Extra directives
-		{$MERCURE_EXTRA_DIRECTIVES}
+	}
+
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API)
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
+
+	# `handle` blocks are mutually exclusive. Caddy sorts them by matcher
+	# specificity, then runs the first one that matches.
+	# @mercure_hub excludes the debug subtree itself, so the /debug/* 403 holds
+	# whatever the block order.
+
+	# Transport-aware health check, reverse-proxied to the admin API
+	# (loopback-only inside the container). Path-scoped so only
+	# /mercure/health/{ready,live} reaches admin — no other admin
+	# endpoint is externally exposed. External probes (k8s liveness,
+	# monitoring) use this; container HEALTHCHECK hits admin via
+	# 127.0.0.1:2019 directly.
+	#
+	# `header_up Host {upstream_hostport}` sends Host 127.0.0.1:2019, which
+	# admin's origin check accepts.
+	handle /mercure/health/* {
+		reverse_proxy 127.0.0.1:2019 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	# Defense in depth: refuse the debug UI subtree whatever the mercure config.
+	# If MERCURE_EXTRA_DIRECTIVES enables `debugger` or `playground`, this 403
+	# still keeps /.well-known/mercure/debug/playground-token (the minted
+	# all-access token) unreachable. The insecure playground endpoints
+	# (/playground/*) are dev-only and served by local.Caddyfile; they are not
+	# routed here, so they answer 404 even if `playground` is enabled by mistake.
+	handle /.well-known/mercure/debug/* {
+		respond "Forbidden" 403
+	}
+
+	# Every path the mercure module serves here: the hub and its subscription
+	# endpoints (/.well-known/mercure*) and the RFC 9728 protected resource
+	# metadata. The playground endpoints are dev-only and served by
+	# local.Caddyfile. The debug subtree is excluded so the 403 above always
+	# applies.
+	@mercure_hub {
+		path /.well-known/mercure* /.well-known/oauth-protected-resource/.well-known/mercure
+		not path /.well-known/mercure/debug/*
+	}
+
+	# `route` keeps `tracing` ahead of `mercure` in written order (and tolerates
+	# whatever MERCURE_TRACING_DIRECTIVE expands to). Scoped to the hub paths so
+	# only publish/subscribe/metadata is traced — not health probes,
+	# robots, or 404s.
+	# Empty by default (no middleware added); set MERCURE_TRACING_DIRECTIVE=tracing
+	# to emit spans.
+	handle @mercure_hub {
+		route {
+			{$MERCURE_TRACING_DIRECTIVE:}
+			mercure {
+				# Human-readable hub identifier: selects the per-hub health endpoints and the transport pool key.
+				# /mercure/health/{$MERCURE_HUB_NAME}/{ready,live} — defaults to "default" if unset.
+				name {$MERCURE_HUB_NAME:default}
+				# Trusted issuer: binds the `iss` claim access tokens must carry
+				# (RFC 9068) to its verification keys. The localhost default suits
+				# local development only; in production set MERCURE_TRUSTED_ISSUERS to
+				# the stable identifier of your token issuer.
+				#
+				# JWT authentication (REQUIRED - the chosen mode's variables have no
+				# defaults, Caddy fails if they are not set). MERCURE_ISSUER_MODE picks
+				# the snippet defined at the top of this file: `keys` (default)
+				# verifies with MERCURE_*_JWT_KEY/_ALG, `jwks` with
+				# MERCURE_PUBLISHER_JWKS_URI and MERCURE_SUBSCRIBER_JWKS_URI.
+				import mercure_issuer_{$MERCURE_ISSUER_MODE:keys}
+				# Extra directives (transport, cors_origins, subscriptions, etc.)
+				{$MERCURE_EXTRA_DIRECTIVES}
+			}
+
+			# mercure handles only the paths it serves and otherwise falls
+			# through here — reached inside the same route, since mercure doesn't
+			# call next when it did handle the request.
+			respond "Not Found" 404
+		}
+	}
+
+	handle /robots.txt {
+		respond `User-agent: *
+        Disallow: /`
+	}
+
+	handle / {
+		respond "Forbidden" 403
+	}
+
+	handle {
+		respond "Not Found" 404
 	}
 
 	{$CADDY_SERVER_EXTRA_DIRECTIVES}
 
+	# Skip logging for robots.txt and favicon.ico
 	log_skip /robots.txt
 	log_skip /favicon.ico
-
-	header / Content-Type "text/html; charset=utf-8"
-	respond / `<!DOCTYPE html>
-	<html lang=en>
-	<meta charset="utf-8">
-	<meta name="robots" content="noindex">
-	<title>Welcome to Mercure</title>
-	<h1>Welcome to Mercure</h1>
-	<p>The URL of your hub is <code>/.well-known/mercure</code>.
-	Read the documentation on <a href="https://mercure.rocks">Mercure.rocks, real-time apps made easy</a>.`
-	respond /robots.txt `User-agent: *
-	Disallow: /`
-	respond "Not Found" 404
 }

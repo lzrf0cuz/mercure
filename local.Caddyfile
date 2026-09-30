@@ -1,0 +1,144 @@
+# Mercure Hub - Local Development Environment
+# Caddy manages TLS directly (no reverse proxy)
+# TLS is only enabled on the main server — :9091 (metrics) and admin (:2019) are plain HTTP
+# https://mercure.rocks/docs/hub/config
+# https://caddyserver.com/docs/caddyfile
+{
+	# Served with `-c <file>` and never `--resume`: autosave.json would be
+	# written to the developer's Caddy config dir and never read.
+	persist_config off
+
+	# Cap shutdown at 10s: by default Caddy waits for open SSE streams to end,
+	# which slows Ctrl+C and wgo restarts.
+	grace_period 10s
+
+	{$GLOBAL_OPTIONS}
+}
+
+# Trusted issuer, in the two shapes a deployment can verify tokens with.
+# The mercure block below imports one, chosen by MERCURE_ISSUER_MODE:
+#   keys (default) - verification secrets/keys from MERCURE_{PUBLISHER,SUBSCRIBER}_JWT_{KEY,ALG}
+#   jwks           - JWK Set URLs from MERCURE_{PUBLISHER,SUBSCRIBER}_JWKS_URI (file:// accepted)
+# {env.VAR} is the runtime placeholder resolved at module Provision time
+# (see populateJWTConfig in caddy/mercure.go) — survives multi-line PEM keys
+# that {$VAR} (parse-time substitution) would mangle by splitting them across
+# Caddyfile directives.
+(mercure_issuer_keys) {
+	issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
+		publisher {
+			jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+		}
+		subscriber {
+			jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+		}
+	}
+}
+
+(mercure_issuer_jwks) {
+	issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
+		publisher {
+			jwks_uri {$MERCURE_PUBLISHER_JWKS_URI}
+		}
+		subscriber {
+			jwks_uri {$MERCURE_SUBSCRIBER_JWKS_URI}
+		}
+	}
+}
+
+# Prometheus metrics on plain HTTP :9091. The admin API (:2019) also serves
+# /metrics; in production admin is loopback-only, so :9091 is the scrape target.
+:9091 {
+	handle /metrics {
+		metrics
+	}
+	handle {
+		respond 404
+	}
+}
+
+{$CADDY_EXTRA_CONFIG}
+
+{$SERVER_NAME:localhost} {
+	log
+
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API).
+	# Static UI assets at /.well-known/mercure/debug/* are still compressed.
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
+
+	# Same handle layout as Caddyfile, without the /debug/* 403: dev serves the debug UI.
+
+	# Transport-aware health check via the admin API. In dev, admin is
+	# also reachable directly at http://localhost:2019 via the compose
+	# port forward; this route mirrors prod's external-probe pattern so
+	# https://localhost/mercure/health/ready works the same way.
+	handle /mercure/health/* {
+		reverse_proxy 127.0.0.1:2019 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	# Every path the mercure module serves: the hub and its subscription
+	# endpoints (/.well-known/mercure*, including the debug UI when `debugger`
+	# or `playground` is on, as in .env.dev), the playground endpoints
+	# (/playground/*), and the RFC 9728 protected resource metadata.
+	@mercure_hub {
+		path /.well-known/mercure* /playground/* /.well-known/oauth-protected-resource/.well-known/mercure
+	}
+
+	handle @mercure_hub {
+		# `route` keeps `tracing` ahead of `mercure` in written order (and
+		# tolerates whatever MERCURE_TRACING_DIRECTIVE expands to). Empty by
+		# default — no middleware added, so the dev hub runs trace-free.
+		# `task dev:full:tracing` sets it to `tracing` and points OTEL_* at the
+		# Jaeger sidecar to turn collection on.
+		route {
+			{$MERCURE_TRACING_DIRECTIVE:}
+			mercure {
+				# Human-readable hub identifier: selects the per-hub health endpoints and the transport pool key.
+				# /mercure/health/{$MERCURE_HUB_NAME}/{ready,live} — defaults to "default" if unset.
+				name {$MERCURE_HUB_NAME:default}
+				# Trusted issuer: binds the `iss` claim access tokens must carry
+				# (RFC 9068) to its verification keys. The localhost default is what
+				# the fixtures/jwt tokens carry; override MERCURE_TRUSTED_ISSUERS only
+				# to test another issuer.
+				#
+				# JWT authentication. Values are read from the env vars set in
+				# .env.dev (HS256 demo secret) by the `keys` snippet defined at the
+				# top of this file. Set MERCURE_ISSUER_MODE=jwks to verify with the
+				# MERCURE_{PUBLISHER,SUBSCRIBER}_JWKS_URI JWK Sets instead.
+				# See .env.dev "RS256 with PEM key" section to switch to RS256.
+				import mercure_issuer_{$MERCURE_ISSUER_MODE:keys}
+				# Extra directives (cors, transport, features, etc.)
+				{$MERCURE_EXTRA_DIRECTIVES}
+			}
+
+			# mercure handles only the paths it serves (e.g. it no-ops on
+			# /playground/* when playground is off) and otherwise falls through
+			# here — reached inside the same route, since mercure doesn't call
+			# next when it did handle the request.
+			respond "Not Found" 404
+		}
+	}
+
+	handle /robots.txt {
+		respond `User-agent: *
+        Disallow: /`
+	}
+
+	# Redirect / to the debug UI. Top-level, not in a `handle /` block, where a
+	# lone `/...` argument would be read as a matcher.
+	redir / /.well-known/mercure/debug/ 302
+
+	handle {
+		respond "Not Found" 404
+	}
+
+	{$CADDY_SERVER_EXTRA_DIRECTIVES}
+
+	# Skip logging for robots.txt and favicon.ico
+	log_skip /robots.txt
+	log_skip /favicon.ico
+}

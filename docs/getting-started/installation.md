@@ -68,7 +68,7 @@ volumes:
   mercure_config:
 ```
 
-The `/data` volume holds the BoltDB history; `/config` holds Caddy's autosaved configuration. See [Docker deployment](../deployment/docker.md) for healthchecks and rootless mode.
+The `/data` volume holds the BoltDB history; `/config` is Caddy's configuration directory. See [Docker deployment](../deployment/docker.md) for healthchecks and rootless mode.
 
 ## Kubernetes (Helm)
 
