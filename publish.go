@@ -49,6 +49,13 @@ var (
 	ErrInvalidData       = errors.New(`"data" field is not valid UTF-8`)
 )
 
+// ErrPublishTimeout is the cause attached to the dispatch context when a
+// configured publish_timeout expires. PublishHandler matches it via
+// context.Cause so that only a publish_timeout abort maps to 504; a
+// context.DeadlineExceeded arriving from any other source (a parent context, a
+// transport-internal deadline) keeps its normal mapping.
+var ErrPublishTimeout = errors.New("publish dispatch exceeded publish_timeout")
+
 // Validate enforces the publish-side input rules that protect subscribers
 // from update forgery and SSE field injection. Hub.Publish calls it, so the
 // bundled hub and PublishHandler are already covered.
@@ -126,9 +133,37 @@ func (u *Update) Validate(baseURL string) error {
 	return nil
 }
 
+// ValidSSEFieldValue reports whether s is safe to write verbatim as an SSE
+// field value: valid UTF-8 with no control or format characters (CWE-93).
+func ValidSSEFieldValue(s string) bool {
+	return validProtocolString(s)
+}
+
+// ValidateSSEFields checks the ID and Type written verbatim by Event.String.
+// Transports receiving stored updates can use it without rejecting reserved topics.
+func (u *Update) ValidateSSEFields() error {
+	if !ValidSSEFieldValue(u.ID) {
+		return ErrInvalidEventID
+	}
+
+	if !ValidSSEFieldValue(u.Type) {
+		return ErrInvalidEventType
+	}
+
+	return nil
+}
+
 // Publish broadcasts the given update to all subscribers.
 // Publish takes ownership of update: transports may deliver it asynchronously, so callers must
 // not modify it, including its Topics slice, after the call. The transport may set its ID.
+//
+// Do not copy the update by value either: the copy carries the cached SSE
+// bytes and their sync.Once.
+//
+// Mutating after delivery is unsafe too. The transport may fan the same
+// pointer out to live subscribers (Local, Bolt's live fan-out), who then get
+// the stale cached bytes, while Bolt replays the new fields to history
+// subscribers.
 func (h *Hub) Publish(ctx context.Context, update *Update) error {
 	ctx, span := startSpan(ctx, "mercure.publish", trace.WithSpanKind(trace.SpanKindProducer))
 	// Deferred so the ID assigned by the transport via AssignUUID lands on the span.
@@ -146,6 +181,7 @@ func (h *Hub) Publish(ctx context.Context, update *Update) error {
 		}
 
 		recordSpanError(span, err)
+		h.recordPublishFailure(update, PublishFailureReasonValidation)
 
 		return err
 	}
@@ -153,11 +189,24 @@ func (h *Hub) Publish(ctx context.Context, update *Update) error {
 	ctx = context.WithValue(ctx, UpdateContextKey, update)
 
 	if err := h.transport.Dispatch(ctx, update); err != nil {
-		if h.logger.Enabled(ctx, slog.LevelError) {
-			h.logger.LogAttrs(ctx, slog.LevelError, "Failed to dispatch update", slog.Any("error", err))
+		// A closed transport is shutting down, not failing: Debug. An update
+		// the transport refuses as too large is a client error (413, reason
+		// validation): Info, like the other validation rejections.
+		level := slog.LevelError
+
+		switch {
+		case errors.Is(err, ErrClosedTransport):
+			level = slog.LevelDebug
+		case errors.Is(err, ErrCodecPayloadTooLarge):
+			level = slog.LevelInfo
+		}
+
+		if h.logger.Enabled(ctx, level) {
+			h.logger.LogAttrs(ctx, level, "Failed to dispatch update", slog.Any("error", err))
 		}
 
 		recordSpanError(span, err)
+		h.recordPublishFailure(update, publishFailureReasonForDispatch(ctx, err))
 
 		return err //nolint:wrapcheck
 	}
@@ -169,6 +218,46 @@ func (h *Hub) Publish(ctx context.Context, update *Update) error {
 	}
 
 	return nil
+}
+
+// recordPublishFailure reports a failed publish to the optional
+// PublishFailureReporter extension of h.metrics, when implemented.
+func (h *Hub) recordPublishFailure(u *Update, reason PublishFailureReason) {
+	if r, ok := h.metrics.(PublishFailureReporter); ok {
+		r.UpdatePublishFailed(u, reason)
+	}
+}
+
+// isPublishTimeout reports whether a Hub.Publish dispatch error is a
+// publish_timeout abort: the dispatch context's cause is ErrPublishTimeout and
+// the returned error is itself a deadline error (context.DeadlineExceeded) or
+// the ErrPublishTimeout sentinel. Anchoring on the cause, not a bare
+// DeadlineExceeded, keeps an unrelated context's deadline from being mistaken
+// for a publish_timeout. PublishHandler (→ 504) and publishFailureReasonForDispatch
+// (→ reason=timeout) share this single predicate so the two cannot drift apart
+// and the timeout metric tracks 504s exactly.
+func isPublishTimeout(ctx context.Context, err error) bool {
+	return errors.Is(context.Cause(ctx), ErrPublishTimeout) &&
+		(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrPublishTimeout))
+}
+
+// publishFailureReasonForDispatch classifies a transport.Dispatch error for the
+// failure metric: a publish_timeout abort (see isPublishTimeout) is timeout; an
+// update the transport refuses as too large (ErrCodecPayloadTooLarge, answered
+// 413) is validation, a client error like the other content rejections; every
+// other dispatch failure (transport unreachable, XADD error, codec error, or
+// any deadline error not tagged with the ErrPublishTimeout cause) falls into
+// the transport catch-all.
+func publishFailureReasonForDispatch(ctx context.Context, err error) PublishFailureReason {
+	if isPublishTimeout(ctx, err) {
+		return PublishFailureReasonTimeout
+	}
+
+	if errors.Is(err, ErrCodecPayloadTooLarge) {
+		return PublishFailureReasonValidation
+	}
+
+	return PublishFailureReasonTransport
 }
 
 // PublishHandler allows publisher to broadcast updates to all subscribers.
@@ -194,7 +283,7 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 	if h.publisherConfigured {
 		var err error
 
-		claims, err = h.authorize(r, true)
+		claims, err = h.authorizeAndBind(r, span, true)
 		if err != nil || claims == nil {
 			h.writeAuthError(w, r, err)
 
@@ -223,6 +312,7 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 	topics := r.PostForm["topic"]
 	if len(topics) == 0 {
 		http.Error(w, `Missing "topic" parameter`, http.StatusBadRequest)
+		h.recordPublishFailure(&Update{}, PublishFailureReasonValidation)
 
 		return
 	}
@@ -230,8 +320,13 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 	// Reject oversized topic lists before running canDispatch — otherwise
 	// an authenticated publisher could force O(topics × matchers)
 	// matching work on every request before being rejected by validate.
+	// These early rejects never reach Hub.Publish, so they meter the
+	// validation failure themselves (as do the missing-topic and invalid-retry
+	// rejects). A ParseForm failure is a body read or size problem, not a
+	// rejection of the update's content, so it is not metered.
 	if len(topics) > maxPublishTopics {
 		http.Error(w, ErrTooManyTopics.Error(), http.StatusBadRequest)
+		h.recordPublishFailure(&Update{Topics: topics}, PublishFailureReasonValidation)
 
 		return
 	}
@@ -240,6 +335,7 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 	for _, t := range topics {
 		if !validProtocolString(t) || len(t) > maxTopicLength {
 			http.Error(w, fmt.Errorf("%q: %w", t, ErrInvalidTopic).Error(), http.StatusBadRequest)
+			h.recordPublishFailure(&Update{Topics: topics}, PublishFailureReasonValidation)
 
 			return
 		}
@@ -251,6 +347,7 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 		var err error
 		if retry, err = strconv.ParseUint(retryString, 10, 64); err != nil {
 			http.Error(w, `Invalid "retry" parameter`, http.StatusBadRequest)
+			h.recordPublishFailure(&Update{Topics: topics}, PublishFailureReasonValidation)
 
 			return
 		}
@@ -294,11 +391,35 @@ func (h *Hub) PublishHandler(w http.ResponseWriter, r *http.Request) {
 		Event:   Event{r.PostForm.Get("data"), r.PostForm.Get("id"), r.PostForm.Get("type"), retry},
 	}
 
+	// Detach from the request context so a publisher disconnecting mid-publish
+	// does not abort the dispatch (the update would otherwise be lost). When a
+	// publish timeout is configured, bound the now-detached dispatch so a stalled
+	// transport cannot block this goroutine indefinitely. WithTimeoutCause tags
+	// the expiry with ErrPublishTimeout so the 504 below fires only for this
+	// handler's deadline, not a context.DeadlineExceeded from some other source.
 	dispatchCtx := context.WithoutCancel(ctx)
+
+	if h.publishTimeout > 0 {
+		var cancel context.CancelFunc
+
+		dispatchCtx, cancel = context.WithTimeoutCause(dispatchCtx, h.publishTimeout, ErrPublishTimeout)
+		defer cancel()
+	}
 
 	// Validation, dispatch, logging and metrics live in Hub.Publish.
 	if err := h.Publish(dispatchCtx, u); err != nil {
 		switch {
+		// A publish_timeout abort shows up as the dispatch context's cause. The
+		// update may already be stored, so answer 504 instead of a plain
+		// failure. The returned error must be a deadline error too, so a fast
+		// unrelated error isn't reported as 504 when the deadline expires just
+		// after it.
+		case isPublishTimeout(dispatchCtx, err):
+			http.Error(w, "publish timed out: the update may already have been published; if you sent an id, retry with the same one so subscribers can detect the duplicate", http.StatusGatewayTimeout)
+		// The transport refused the update as too large to store and read back;
+		// retrying it cannot succeed, unlike the 500 below.
+		case errors.Is(err, ErrCodecPayloadTooLarge):
+			http.Error(w, ErrCodecPayloadTooLarge.Error(), http.StatusRequestEntityTooLarge)
 		case errors.Is(err, ErrReservedTopic), errors.Is(err, ErrReservedWildcard),
 			errors.Is(err, ErrInvalidEventID), errors.Is(err, ErrInvalidEventType),
 			errors.Is(err, ErrReservedEventType),

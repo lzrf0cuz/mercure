@@ -1,0 +1,85 @@
+# Hub observability stack, included by compose.yaml: Prometheus and Grafana
+# always on, Jaeger behind the `tracing` profile (spans need
+# MERCURE_TRACING_DIRECTIVE=tracing). Prometheus scrapes the hub at
+# mercure:9091. Container names and host ports match
+# redistransport/compose.observability.yaml, so run one stack at a time.
+
+services:
+  prometheus:
+    container_name: prometheus
+    image: ${PROMETHEUS_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      mercure:
+        condition: service_healthy
+
+  grafana:
+    container_name: grafana
+    image: ${GRAFANA_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # Grafana 12.x deprecated non-Viewer anonymous roles; only Viewer is
+      # supported. Sign in as admin/admin (above) for the few cases that
+      # need edit/save (panel tweaks, datasource changes, etc.).
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # Disable the plugin-update poll ([analytics] check_for_plugin_updates).
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      # Disable usage reporting to grafana.com ([analytics] reporting_enabled).
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:3000/api/health" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # Jaeger all-in-one: OTLP receiver, storage and web UI. The hub exports to
+  # jaeger:4317 when MERCURE_TRACING_DIRECTIVE=tracing — see docs/production/tracing.md.
+  jaeger:
+    profiles: ["tracing"]
+    container_name: jaeger
+    image: ${JAEGER_IMAGE}
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "127.0.0.1:16686:16686"  # web UI — http://localhost:16686
+      - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
+      - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+    healthcheck:
+      # 14269 is Jaeger all-in-one's admin/health port (not 16686 the UI, not
+      # 4317/4318 OTLP). If you swap to jaeger-v2 / a split collector image,
+      # this port changes.
+      test: [ "CMD-SHELL", "wget -q --spider http://localhost:14269/ || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # all-in-one can take 15-25s to answer on :14269 after a cold pull.
+      start_period: 30s
+
+volumes:
+  prometheus_data:
+  grafana_data:

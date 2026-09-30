@@ -160,6 +160,8 @@ For a first cluster, start with Redis/Valkey. For help choosing and sizing a dep
 
 The transport interface is small and public. If you need a custom backend, implement [`transport.go`](https://github.com/dunglas/mercure/blob/main/transport.go) and build a hub with `xcaddy`.
 
+This repository also builds an open-source Redis/Valkey Streams transport; its configuration is in [redistransport/README.md](../../redistransport/README.md#configuration-reference).
+
 ## License keys
 
 Set `MERCURE_LICENSE` to the key supplied with your [Self-Hosted plan](https://mercure.rocks/pricing). Inject it through your deployment's secret store alongside the publisher and subscriber keys:

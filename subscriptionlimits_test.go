@@ -41,7 +41,7 @@ func TestSubscriptionLimits(t *testing.T) {
 
 			first, _ := register()
 			require.NotNil(t, first)
-			t.Cleanup(func() { h.shutdown(t.Context(), first) })
+			t.Cleanup(func() { h.shutdown(t.Context(), first, DisconnectReasonUnknown) })
 
 			second, _ := register()
 			require.NotNil(t, second)
@@ -56,12 +56,12 @@ func TestSubscriptionLimits(t *testing.T) {
 			assertGaugeValue(t, 2, metrics.subscribers)
 			assertCounterValue(t, 1, metrics.subscriptionsRejected.WithLabelValues(tc.reason))
 
-			h.shutdown(t.Context(), second)
+			h.shutdown(t.Context(), second, DisconnectReasonUnknown)
 
 			replacement, w := register()
 			require.NotNil(t, replacement)
 			assert.Equal(t, http.StatusOK, w.Code)
-			h.shutdown(t.Context(), replacement)
+			h.shutdown(t.Context(), replacement, DisconnectReasonUnknown)
 		})
 	}
 }
@@ -224,7 +224,7 @@ func TestSubscriptionTokenLimitSharesCookieAndHeaderCapacity(t *testing.T) {
 
 	first, _ := h.registerSubscriber(t.Context(), httptest.NewRecorder(), firstRequest)
 	require.NotNil(t, first)
-	t.Cleanup(func() { h.shutdown(t.Context(), first) })
+	t.Cleanup(func() { h.shutdown(t.Context(), first, DisconnectReasonUnknown) })
 
 	cookieRequest := httptest.NewRequest(http.MethodGet, defaultHubURL+"?match=foo", nil)
 	cookieRequest.AddCookie(&http.Cookie{Name: defaultCookieName, Value: token})
@@ -238,5 +238,5 @@ func TestSubscriptionTokenLimitSharesCookieAndHeaderCapacity(t *testing.T) {
 	otherRequest.Header.Set("Authorization", bearerPrefix+createDummyAuthorizedJWT(roleSubscriber, []string{"foo"}))
 	other, _ := h.registerSubscriber(t.Context(), httptest.NewRecorder(), otherRequest)
 	require.NotNil(t, other)
-	h.shutdown(t.Context(), other)
+	h.shutdown(t.Context(), other, DisconnectReasonUnknown)
 }

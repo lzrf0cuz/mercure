@@ -20,6 +20,8 @@ All health endpoints live on the Caddy admin API (default `localhost:2019`):
 
 The bundled BoltDB and local transports do not implement remote dependency checks, so their probes return `200`. This does not verify disk capacity or end-to-end delivery. Shared transports can implement their own readiness and liveness checks.
 
+The `Caddyfile` and `local.Caddyfile` bundled with this repository's images also reverse-proxy `/mercure/health/*` from the public listener to the loopback admin API, so `https://<host>/mercure/health/ready` works from outside the container. Only these paths reach admin; the proxy sends `Host 127.0.0.1:2019`, which admin's origin check accepts.
+
 ## Why Mercure has two health endpoints
 
 Readiness can fail during a temporary transport outage. Liveness lets a transport distinguish temporary failures from conditions that require a restart; the exact checks depend on the transport.
@@ -28,7 +30,7 @@ Restarting a hub during a temporary backend outage also disconnects its subscrib
 
 ## Probing from outside the container
 
-The admin API binds to `localhost:2019` for security. That means standard `httpGet` probes, which run from outside the container, can't reach it. Use `exec` probes instead:
+The admin API binds to `localhost:2019` for security. That means standard `httpGet` probes, which run from outside the container, can't reach it. Use `exec` probes instead (or, with the bundled Caddyfiles, probe the proxied `/mercure/health/*` path on the public listener):
 
 ```yaml
 readinessProbe:
@@ -109,6 +111,10 @@ Metrics live on the admin API at `/metrics`. The hub exposes Caddy's built-in me
 | `mercure_subscribers_total`     | Total subscribers seen.                  |
 | `mercure_updates_total`         | Total updates published.                 |
 
+The bundled `Caddyfile` and `local.Caddyfile` also serve `/metrics` on a plain-HTTP `:9091` listener, which the image exposes and the repository's Prometheus config scrapes. It has no TLS or authentication: keep it off the public network. It does not depend on the global `metrics` option (the `metrics` handler serves the configuration's registry, so the `mercure_*` series are there); Caddy's HTTP request metrics (`caddy_http_*`) need the option.
+
+See the [metrics reference](metrics.md) for every hub metric, its type and labels, rejection status mappings, and the provisioned Grafana dashboard.
+
 Plus standard Caddy metrics: request counts, latencies, in-flight requests, certificate expiry. See the [Caddy metrics docs](https://caddyserver.com/docs/metrics).
 
 ## Useful alerts for the Mercure hub
@@ -125,10 +131,10 @@ Set thresholds from your workload and availability targets:
 
 ## Mercure Grafana dashboards
 
-A reasonable Grafana panel set:
+The repository provisions a hub dashboard, `grafana/dashboards/hub.json`, in the Grafana started by the root compose stack (`task up`) and by `task dev:full`; see the [metrics reference](metrics.md#dashboard). To build your own, a reasonable Grafana panel set:
 
 - **Connections**: `mercure_subscribers_connected` per pod, stacked.
-- **Publish rate**: `rate(mercure_updates_total[1m])`, with publish error responses from HTTP metrics or logs overlaid.
+- **Publish rate**: `rate(mercure_updates_total[1m])`, with `rate(mercure_updates_failed_total[1m])` by `reason` overlaid.
 - **Reconnect rate**: `rate(mercure_subscribers_total[1m])`. Compare spikes with deployment and proxy events.
 - **Transport health**: readiness endpoint state (a synthetic probe writing to a metric).
 - **Latency**: request duration histograms from Caddy.

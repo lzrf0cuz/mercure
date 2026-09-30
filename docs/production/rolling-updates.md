@@ -18,7 +18,7 @@ When the hub receives a shutdown signal (`SIGTERM`, the Caddy admin `/stop` endp
 
 The hub randomizes connection deadlines between 80% and 100% of `write_timeout` (480 to 600 seconds by default). During shutdown, existing connections use those deadlines. This spreads reconnections, although the distribution still depends on when clients connected.
 
-With `write_timeout 0s`, the hub closes subscribers immediately on shutdown, unless [`drain_timeout`](#faster-drains-with-drain_timeout) is set.
+With `write_timeout 0s`, only a token's `exp` sets a connection-expiry timer. In the default mode a token without `exp` is rejected with `401`, so only anonymous subscribers have no timer; with `protocol_version_compatibility` on a `deprecated_claim` build, `exp` is optional and a token without it has no timer either. The `dispatch_timeout` deadline only bounds a write in progress. On every applied config reload, even a forced reload of an unchanged config, the hub closes every subscriber immediately. On a stop it does the same, unless [`drain_timeout`](#faster-drains-with-drain_timeout) is set: the stop then drains first (a deadline already set by a token's `exp` is kept), and connections still open when Caddy's `grace_period` ends the drain are closed.
 
 ## Sizing the drain window
 
@@ -27,6 +27,10 @@ The orchestrator must allow enough time between `SIGTERM` and `SIGKILL`; otherwi
 **The rule:** `stop timeout >= write_timeout + small margin`.
 
 For the default `write_timeout 600s`, a 660s grace period is the right starting point. If you bump `write_timeout`, bump the orchestrator's grace period to match, or set `drain_timeout`.
+
+The Caddyfiles bundled with the images built from this repository set Caddy's `grace_period 10s`: on shutdown they close the remaining SSE streams after 10 seconds, and clients reconnect and, with a transport that keeps history, resume with `Last-Event-ID`. For a full drain, raise it through `GLOBAL_OPTIONS` (for example `grace_period 11m`) or in a custom Caddyfile.
+
+A reload does not close streams when its `grace_period` ends: Go's `Server.Shutdown` does not close active connections, so with a non-zero `write_timeout` and the same transport they continue until their write deadline. With `write_timeout 0s` a reload closes them at once, and a reload that replaces the transport closes them at the reload. Config reloads never trigger the `drain_timeout` drain described below.
 
 ## Faster drains with `drain_timeout`
 
@@ -47,9 +51,16 @@ localhost {
 
 The drain starts on Caddy's `stopping` event, before the [`shutdown_delay`](https://caddyserver.com/docs/caddyfile/options#shutdown-delay). Connections opened during the delay get a full `drain_timeout`. A Caddy [`grace_period`](https://caddyserver.com/docs/caddyfile/options#grace-period) shorter than `drain_timeout` cuts the drain short.
 
-With `write_timeout 0s`, connections never rotate, but `drain_timeout` still drains them on termination.
+A stop also drains subscribers that connected before a config reload, if the configuration they connected under set `drain_timeout`. Each closes within that `drain_timeout`, counted from the stop or, for a request that reaches the replaced configuration after the stop starts, from its arrival. The stop waits for them within its `grace_period`, like current subscribers. This needs a `mercure` handler in the configuration running when the stop arrives.
 
-Config reloads never trigger the drain. With `write_timeout 0s`, a reload still closes subscribers immediately.
+If a reload lowered `drain_timeout`, size the stop timeout from the largest value: `stop timeout >= shutdown_delay + largest drain_timeout + small margin`.
+
+Two cases are not drained, and both end with the disconnect reason `transport_ended`:
+
+- The reload replaced the transport or removed every `mercure` handler: the subscribers closed at the reload.
+- Their configuration had no `drain_timeout`. While the reload's `grace_period` runs, the stop waits for them like for current connections, and after it they close when the stop releases the transport, after the current configuration's drain or at the end of the stop's `grace_period`.
+
+With `write_timeout 0s`, connections never rotate, but `drain_timeout` still drains them on termination.
 
 ## Kubernetes
 
@@ -112,6 +123,8 @@ kubectl exec -it $POD -- wget -qO- localhost:2019/metrics | grep subscribers_con
 ```
 
 Trigger a `kubectl rollout restart deployment/mercure` and watch the value glide rather than collapse.
+
+During a stop the bundled `:9091` metrics listener is already closed, so a Prometheus target on it shows no drain progress; watch the admin endpoint (`:2019`) as above.
 
 ## What Mercure clients see during a rolling update
 
