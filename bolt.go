@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -14,13 +15,17 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const BoltDefaultCleanupFrequency = 0.3
 
-const defaultBoltBucketName = "updates"
+// BoltDefaultBucketName is the bucket a Bolt transport uses when none is set.
+const BoltDefaultBucketName = "updates"
+
+const defaultBoltBucketName = BoltDefaultBucketName
 
 // maxHistoryScan is the default bound on the search for a requested
 // Last-Event-ID: without it an ancient or forged id forces an O(history) scan
@@ -90,6 +95,25 @@ func NewBoltTransport(
 	}, nil
 }
 
+// boltSeqLen is the size of the big-endian sequence prefix of a BoltDB key.
+const boltSeqLen = 8
+
+// boltKeySeq returns the sequence prefix of the BoltDB key k, or false when k
+// is too short to hold one: a bucket not written by Mercure, or a corrupted file.
+func boltKeySeq(k []byte) (uint64, bool) {
+	if len(k) < boltSeqLen {
+		return 0, false
+	}
+
+	return binary.BigEndian.Uint64(k[:boltSeqLen]), true
+}
+
+var errForeignBoltKey = errors.New("key not written by Mercure")
+
+func foreignBoltKeyError(bucketName string, k []byte) error {
+	return fmt.Errorf("bucket %q holds a %w (%d bytes, want at least %d)", bucketName, errForeignBoltKey, len(k), boltSeqLen)
+}
+
 func getDBLastEvent(db *bolt.DB, bucketName string) (uint64, string, error) {
 	var lastSeq uint64
 
@@ -102,8 +126,13 @@ func getDBLastEvent(db *bolt.DB, bucketName string) (uint64, string, error) {
 		}
 
 		if k, _ := b.Cursor().Last(); k != nil {
-			lastSeq = binary.BigEndian.Uint64(k[:8])
-			lastEventID = string(k[8:])
+			seq, ok := boltKeySeq(k)
+			if !ok {
+				return foreignBoltKeyError(bucketName, k)
+			}
+
+			lastSeq = seq
+			lastEventID = string(k[boltSeqLen:])
 		}
 
 		return nil
@@ -136,7 +165,7 @@ func (t *BoltTransport) Dispatch(ctx context.Context, update *Update) error {
 	defer t.Unlock()
 
 	if err := t.persist(update.ID, updateJSON); err != nil {
-		return err
+		return closedIfNotOpen(err)
 	}
 
 	for _, s := range t.subscribers.MatchAny(update) {
@@ -144,6 +173,17 @@ func (t *BoltTransport) Dispatch(ctx context.Context, update *Update) error {
 	}
 
 	return nil
+}
+
+// closedIfNotOpen makes an error caused by Close having closed the database
+// under a call that passed the closed check satisfy errors.Is(err,
+// ErrClosedTransport), so the hub treats it as the shutdown it is.
+func closedIfNotOpen(err error) error {
+	if errors.Is(err, bolterrors.ErrDatabaseNotOpen) {
+		return fmt.Errorf("%w: %w", ErrClosedTransport, err)
+	}
+
+	return err
 }
 
 // AddSubscriber adds a new subscriber to the transport.
@@ -155,13 +195,23 @@ func (t *BoltTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) e
 	}
 
 	t.Lock()
+
+	// Close may have finished its disconnect walk since the check above.
+	select {
+	case <-t.closed:
+		t.Unlock()
+
+		return ErrClosedTransport
+	default:
+	}
+
 	t.subscribers.Add(s)
 	toSeq := t.lastSeq
 	t.Unlock()
 
 	if s.RequestLastEventIDSet {
 		if err := t.dispatchHistory(ctx, s, toSeq); err != nil {
-			return err
+			return closedIfNotOpen(err)
 		}
 	}
 
@@ -222,9 +272,12 @@ func (t *BoltTransport) Close(_ context.Context) (err error) {
 // history window. Events whose seq equals toSeq are the most recent ones
 // observed at subscription time and are still considered part of history.
 // toSeq == 0 means the bucket was empty at subscription time, so any key
-// (all with seq >= 1) is "past the bound".
+// (all with seq >= 1) is "past the bound". A key too short to hold a sequence
+// is never past it; the callers skip or reject it.
 func pastSeqBound(k []byte, toSeq uint64) bool {
-	return binary.BigEndian.Uint64(k[:8]) > toSeq
+	seq, ok := boltKeySeq(k)
+
+	return ok && seq > toSeq
 }
 
 // findLastEventID returns the seq of the requested Last-Event-ID. Searching
@@ -256,8 +309,9 @@ func findLastEventID(b *bolt.Bucket, lastEventID string, toSeq, scanLimit uint64
 	)
 
 	for ; k != nil && scanned < scanLimit; k, _ = c.Prev() {
-		if string(k[8:]) == lastEventID {
-			seq, found = binary.BigEndian.Uint64(k[:8]), true
+		// A key not written by Mercure cannot be the requested id: skip it.
+		if keySeq, ok := boltKeySeq(k); ok && string(k[boltSeqLen:]) == lastEventID {
+			seq, found = keySeq, true
 		}
 
 		scanned++
@@ -290,6 +344,12 @@ func (t *BoltTransport) replayHistory(
 
 	c := b.Cursor()
 	for k, v := c.Seek(from); k != nil; k, v = c.Next() {
+		if _, ok := boltKeySeq(k); !ok {
+			s.HistoryDispatched(responseLastEventID)
+
+			return foreignBoltKeyError(t.bucketName, k)
+		}
+
 		// Dispatched since the subscribe snapshot: the live queue owns it.
 		if pastSeqBound(k, toSeq) {
 			break
@@ -437,7 +497,12 @@ func (t *BoltTransport) cleanup(bucket *bolt.Bucket, lastID uint64) error {
 	c := bucket.Cursor()
 	// Deleting under the cursor makes Next skip a key, so restart from the oldest one.
 	for k, _ := c.First(); k != nil; k, _ = c.First() {
-		if binary.BigEndian.Uint64(k[:8]) > removeUntil {
+		seq, ok := boltKeySeq(k)
+		if !ok {
+			return foreignBoltKeyError(t.bucketName, k)
+		}
+
+		if seq > removeUntil {
 			break
 		}
 

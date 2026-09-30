@@ -1,15 +1,87 @@
+### Test artifacts ###
+# Go test coverage artifacts at any depth (go test -coverprofile output)
+coverage.out
+coverage.html
+
+### Security: Secrets & Credentials ###
+
+# Environment files
+.env
+.env.*
+# `task setup` copies each committed .env*.example to its real, ignored name.
+!.env*.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+# Published playground PEM, paired with public/fixtures/private-jwk.json.
+# Allow this public key for the debugger's playground-only copy tools.
+!public/fixtures/public-key.pem
+
+# API keys and tokens
+*.secret
+*-secret.*
+*.credentials
+credentials.json
+service-account*.json
+
+# Cloud provider configs with secrets
+.aws/credentials
+.gcloud/
+.azure/
+
+### Go ###
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+### Editors ###
+.idea/
+*.iws
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+*~
+
+### OS ###
+.DS_Store
+._*
+Thumbs.db
+[Dd]esktop.ini
+
+### Project-specific ###
 *.db
 *.pyc
 __pycache__
 dist
+/bin/
+.task/
 /caddy/caddy
 /caddy/mercure/mercure
 /caddy/mercure/__debug_bin
+
+# Go debugger (Delve/VS Code)
+__debug_bin*
 /cmd/mercure/mercure
 /certs
 /spec/mercure.html
 /spec/mercure.txt
 /spec/mercure.xml
-
-# Go debugger (Delve/VS Code)
-__debug_bin*
+.mercure
+/logs.ndjson

@@ -1,0 +1,125 @@
+version: "2"
+run:
+  tests: true
+linters:
+  default: all
+  disable:
+    # Wants Go-canonical header names; Mercure spells Last-Event-ID and
+    # Mercure-Last-Event-ID.
+    - canonicalheader
+    # gocyclo already caps cyclomatic complexity.
+    - cyclop
+    # Without an allow list it rejects every non-stdlib import; imports are
+    # not restricted here.
+    - depguard
+    # Struct literals rely on zero values for the fields they omit (go-redis
+    # and Caddy options).
+    - exhaustruct
+    # exhaustruct_v5 replaces exhaustruct since golangci-lint v2.13; the root
+    # config disables both.
+    - exhaustruct_v5
+    # The unchecked assertions are on values whose type the code controls
+    # (sync.Pool, sync.Map, Caddy's usage pool).
+    - forcetypeassert
+    # gomodguard is deprecated since v2.12.0 (replaced by gomodguard_v2);
+    # this module does not restrict module imports, so both are disabled
+    # rather than migrated.
+    - gomodguard
+    - gomodguard_v2
+    # importas is in the active set but would need an `alias:` list to be useful,
+    # and this module enforces no import aliases. Disabling it also stops the
+    # info-level advisory golangci-lint otherwise emits on every run.
+    - importas
+    # No line-length limit; long log messages and test tables stay on one line.
+    - lll
+    # Flags literals, such as Lua argument counts, that read better inline.
+    - mnd
+    # `if err := f(); err != nil` is idiomatic and keeps err scoped.
+    - noinlineerr
+    # Named results document multi-value returns in a few helpers.
+    - nonamedreturns
+    # Tests that use t.Setenv or shared transport state cannot call
+    # t.Parallel; tparallel still checks the tests that do.
+    - paralleltest
+    # JSON tags follow the snake_case Caddy config and presence wire format.
+    - tagliatelle
+    # Off as in the hub's root .golangci.yml; there are no examples here.
+    - testableexamples
+    # Tests are white-box: they reach the package's unexported state.
+    - testpackage
+    # Short receiver and loop names (t, r, d, tr) are idiomatic Go.
+    - varnamelen
+    # wsl_v5 is the successor to wsl (deprecated in golangci-lint v2.2.0).
+    - wsl
+  settings:
+    gomoddirectives:
+      replace-local: true
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+    ireturn:
+      allow:
+        - anon
+        - error
+        - empty
+        - stdlib
+        - generic
+        - github.com/dunglas/mercure.Codec
+        - github.com/lzrf0cuz/mercure/redistransport.Codec
+        # Prometheus client_golang types are pure interfaces with unexported
+        # concrete implementations, so returning concretes is not possible.
+        - github.com/prometheus/client_golang/prometheus.Counter
+        # trace.Span is an interface by design (OTel SDK); the local
+        # startSpan helper has to return it. This matches the hub's allowlist.
+        - go.opentelemetry.io/otel/trace.Span
+        # ReadOnlySpan is the OTel SDK's interface for inspecting ended
+        # spans. The tracer_test helpers use it to find spans by name.
+        - go.opentelemetry.io/otel/sdk/trace.ReadOnlySpan
+    spancheck:
+      # startSpan returns the span unended on purpose; the caller owns
+      # span.End. Register the helper so spancheck doesn't flag the
+      # return as a leak. This matches the hub's spancheck config.
+      extra-start-span-signatures:
+        - "github.com/lzrf0cuz/mercure/redistransport.startSpan:opentelemetry"
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    generated: lax
+    presets:
+      # Doc-comment form rules (package comment, exported-name prefix), as in
+      # the root config; nothing here trips them.
+      - comments
+      # gosec G304 on file paths the operator configures (tls_ca_file) or
+      # tests build.
+      - common-false-positives
+      # gosec G104 repeats errcheck for unchecked errors.
+      - legacy
+      # Unchecked Close errors in test cleanups and teardown.
+      - std-error-handling
+    rules:
+      # Tests may be long, keep fixtures and sentinel errors at package level,
+      # repeat literals, leave TODOs, skip ctx on requests and return unwrapped
+      # errors.
+      - linters:
+          - funlen
+          - gochecknoglobals
+          - goconst
+          - godox
+          - noctx
+          - wrapcheck
+        path: _test\.go
+      # Close() ignores the caller ctx: `caddy validate` calls it with a
+      # caddy.Context whose embedded context is nil, and go-redis would panic on
+      # ctx.Done(). See Close()'s doc comment and TestCloseIgnoresCallerContext.
+      - linters: [contextcheck]
+        path: redis\.go
+        source: "func \\(t \\*RedisTransport\\) Close"
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports

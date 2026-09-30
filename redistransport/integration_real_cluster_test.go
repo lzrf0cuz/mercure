@@ -1,0 +1,644 @@
+//go:build real_redis
+
+package redistransport
+
+// Real Redis Cluster integration tests. These cover the cluster-topology
+// invariants that single-node real_redis tests cannot validate:
+//
+//   - Hash-tag slot consistency for stream/lastEventID/presence keys
+//   - Cross-primary presence enumeration via ClusterClient.Scan
+//   - Multi-hub fan-out over a real cluster
+//   - The production INFO version-check path through ClusterClient
+//
+// Gated by REDIS_CLUSTER_ADDRS (comma-separated seed list). Tests skip
+// cleanly when the env var is unset, so a default `task rt:test:real:redis`
+// run against the single-node compose stack does not fail. The cluster suite
+// runs only when the cluster compose stack (compose.cluster.yaml) is up.
+//
+// To run:
+//
+//	task rt:test:real:cluster      # full lifecycle (up + test + down)
+//	# or, against a cluster you brought up yourself:
+//	task rt:cluster:up
+//	REDIS_CLUSTER_ADDRS=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 \
+//	  go test -tags=real_redis -run 'TestReal_Cluster_' ./redistransport/...
+//	task rt:cluster:down
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/dunglas/mercure"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// realRedisClusterAddrs parses REDIS_CLUSTER_ADDRS (comma-separated). An
+// empty/unset env var returns nil so callers can skip cleanly.
+func realRedisClusterAddrs() []string {
+	env := os.Getenv("REDIS_CLUSTER_ADDRS")
+	if env == "" {
+		return nil
+	}
+
+	parts := strings.Split(env, ",")
+	out := make([]string, 0, len(parts))
+
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
+// probeRealRedisCluster pings a ClusterClient at REDIS_CLUSTER_ADDRS and
+// returns the addresses. Every cluster test calls it first. It skips the test
+// when no cluster is configured or reachable, so the suite does not fail on a
+// laptop without the cluster compose stack up.
+func probeRealRedisCluster(t *testing.T) []string {
+	t.Helper()
+
+	addrs := realRedisClusterAddrs()
+	if len(addrs) == 0 {
+		t.Skip("REDIS_CLUSTER_ADDRS not set (skipping cluster integration test)")
+	}
+
+	probe := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:       addrs,
+		DialTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second,
+	})
+	defer probe.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := probe.Ping(ctx).Err(); err != nil {
+		t.Skipf("real Redis Cluster not reachable at %v: %v", addrs, err)
+	}
+
+	return addrs
+}
+
+// newRealClusterTransport creates a transport over ClusterClient. The
+// {streamName} hash tag places all transport keys (stream, lastEventID,
+// presence:*) in one slot, so multi-key operations (presence MGET, Lua) work.
+func newRealClusterTransport(t *testing.T, opts ...Option) (*RedisTransport, *redis.ClusterClient) {
+	t.Helper()
+
+	addrs := probeRealRedisCluster(t)
+
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:       addrs,
+		DialTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second,
+	})
+
+	transport, streamName := buildRealTransport(t, client, opts...)
+
+	t.Cleanup(func() {
+		_ = transport.Close(context.Background())
+
+		cleanupClusterStreamKeys(client, streamName)
+
+		_ = client.Close()
+	})
+
+	return transport, client
+}
+
+// cleanupClusterStreamKeys deletes the stream + lastEventID + every matching
+// presence key so cluster tests are idempotent under -count=1. All keys
+// share the {streamName} hash tag so DEL routes to a single primary
+// without cross-slot errors. Callers run it after closing the transport,
+// which closes client, so the deletes go through a new client built from
+// client's options.
+func cleanupClusterStreamKeys(client *redis.ClusterClient, streamName string) {
+	opts := *client.Options()
+	cleanup := redis.NewClusterClient(&opts)
+
+	defer cleanup.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	toDelete := []string{
+		"{" + streamName + "}",
+		"{" + streamName + "}:lastEventID",
+	}
+
+	iter := cleanup.Scan(ctx, 0, key(escapeRedisGlob(streamName), ":presence:*"), 100).Iterator()
+	for iter.Next(ctx) {
+		toDelete = append(toDelete, iter.Val())
+	}
+
+	_, _ = cleanup.Del(ctx, toDelete...).Result()
+}
+
+// TestReal_Cluster_VersionValidation verifies the production INFO version
+// check works through ClusterClient. ClusterClient chooses a primary by slot
+// for keyed commands and at random for non-keyed ones. INFO server is
+// non-keyed, so its routing path differs from a basic Client's and is worth
+// exercising.
+func TestReal_Cluster_VersionValidation(t *testing.T) {
+	transport, _ := newRealClusterTransport(t)
+
+	assert.NotNil(t, transport, "transport should initialize without withSkipVersionCheck")
+}
+
+// TestReal_Cluster_EndToEndDispatchReceive verifies a full path
+// from publish through XREADGROUP to the local subscriber against a real cluster.
+func TestReal_Cluster_EndToEndDispatchReceive(t *testing.T) {
+	transport, _ := newRealClusterTransport(t)
+
+	tss := testTopicMatcherStore()
+	sub := mercure.NewLocalSubscriber("", testLogger(), tss)
+	sub.SetMatchers(topicMatchers([]string{"https://example.com/cluster"}), nil)
+
+	require.NoError(t, transport.AddSubscriber(context.Background(), sub))
+
+	require.NoError(t, transport.Dispatch(context.Background(), &mercure.Update{
+		Topics: []string{"https://example.com/cluster"},
+		Data:   "hello cluster",
+	}))
+
+	select {
+	case msg := <-sub.Receive():
+		assert.Equal(t, "hello cluster", msg.Data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for message from cluster")
+	}
+}
+
+// TestReal_Cluster_HashTagSlotConsistency verifies that every transport key
+// hashes to the same Redis Cluster slot. A key outside the {streamName} hash
+// tag would make multi-key operations (XADD+SET, presence MGET) fail with
+// CROSSSLOT.
+//
+// CLUSTER KEYSLOT is deterministic (CRC16 mod 16384 on the substring inside
+// the first {...} pair). Equal slot numbers prove cluster will route them
+// to the same primary, no writes required.
+func TestReal_Cluster_HashTagSlotConsistency(t *testing.T) {
+	transport, client := newRealClusterTransport(t)
+
+	streamName := transport.opts.streamName
+	keys := []string{
+		"{" + streamName + "}",
+		"{" + streamName + "}:lastEventID",
+		"{" + streamName + "}:presence:node-1",
+		"{" + streamName + "}:presence:node-abcdef",
+	}
+
+	ctx := context.Background()
+
+	firstSlot, err := client.ClusterKeySlot(ctx, keys[0]).Result()
+	require.NoError(t, err)
+
+	for _, k := range keys[1:] {
+		slot, err := client.ClusterKeySlot(ctx, k).Result()
+		require.NoError(t, err)
+		assert.Equal(t, firstSlot, slot,
+			"key %q must hash to the same slot as %q", k, keys[0])
+	}
+}
+
+// TestReal_Cluster_MultiHubCrossNodeDispatch verifies cross-hub dispatch
+// over a real cluster. Two transports with separate ClusterClient pools
+// against the same cluster + same streamName: hub A publishes, hub B
+// receives. Mirrors the multi-hub real_redis invariant on cluster topology.
+func TestReal_Cluster_MultiHubCrossNodeDispatch(t *testing.T) {
+	addrs := probeRealRedisCluster(t)
+	streamName := fmt.Sprintf("mercure-cluster-mh-%s-%d", t.Name(), time.Now().UnixNano())
+
+	hubs := make([]*RedisTransport, 2)
+	clients := make([]*redis.ClusterClient, 2)
+
+	for i := range hubs {
+		clients[i] = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:       addrs,
+			DialTimeout: 2 * time.Second,
+			ReadTimeout: 2 * time.Second,
+		})
+
+		tr, err := NewRedisTransport(
+			clients[i],
+			WithLogger(testLogger()),
+			WithStreamName(streamName),
+			WithXReadBlock(50*time.Millisecond),
+			WithHealthInterval(24*time.Hour),
+			WithPresenceInterval(noHeartbeatInterval),
+			withSkipPresenceIntervalCheck(),
+		)
+		require.NoError(t, err)
+
+		hubs[i] = tr
+	}
+
+	t.Cleanup(func() {
+		for _, h := range hubs {
+			_ = h.Close(context.Background())
+		}
+
+		cleanupClusterStreamKeys(clients[0], streamName)
+
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	})
+
+	tss := testTopicMatcherStore()
+	subB := mercure.NewLocalSubscriber("", testLogger(), tss)
+	subB.SetMatchers(topicMatchers([]string{"https://example.com/cluster-mh"}), nil)
+	require.NoError(t, hubs[1].AddSubscriber(context.Background(), subB))
+
+	require.NoError(t, hubs[0].Dispatch(context.Background(), &mercure.Update{
+		Topics: []string{"https://example.com/cluster-mh"},
+		Data:   "from-A-to-B",
+	}))
+
+	select {
+	case msg := <-subB.Receive():
+		assert.Equal(t, "from-A-to-B", msg.Data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub B did not receive message from hub A on cluster")
+	}
+}
+
+// TestReal_Cluster_PresenceAcrossPrimaries verifies that hub B's
+// GetSubscribers (SCAN + MGET through ClusterClient) returns the presence
+// written by both hubs; the keys share the {streamName} slot.
+func TestReal_Cluster_PresenceAcrossPrimaries(t *testing.T) {
+	addrs := probeRealRedisCluster(t)
+	streamName := fmt.Sprintf("mercure-cluster-presence-%s-%d", t.Name(), time.Now().UnixNano())
+
+	tss := testTopicMatcherStore()
+
+	newHub := func() (*RedisTransport, *redis.ClusterClient) {
+		client := redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:       addrs,
+			DialTimeout: 2 * time.Second,
+			ReadTimeout: 2 * time.Second,
+		})
+
+		tr, err := NewRedisTransport(
+			client,
+			WithLogger(testLogger()),
+			WithStreamName(streamName),
+			WithXReadBlock(50*time.Millisecond),
+			WithHealthInterval(24*time.Hour),
+			WithPresenceInterval(noHeartbeatInterval),
+			withSkipPresenceIntervalCheck(),
+		)
+		require.NoError(t, err)
+
+		tr.SetTopicMatcherStore(tss)
+
+		return tr, client
+	}
+
+	hubA, clientA := newHub()
+	hubB, clientB := newHub()
+
+	t.Cleanup(func() {
+		_ = hubA.Close(context.Background())
+		_ = hubB.Close(context.Background())
+
+		cleanupClusterStreamKeys(clientA, streamName)
+
+		_ = clientA.Close()
+		_ = clientB.Close()
+	})
+
+	subA := mercure.NewLocalSubscriber("", testLogger(), tss)
+	subA.SetMatchers(topicMatchers([]string{"https://example.com/cluster-presence"}), nil)
+	require.NoError(t, hubA.AddSubscriber(context.Background(), subA))
+
+	subB := mercure.NewLocalSubscriber("", testLogger(), tss)
+	subB.SetMatchers(topicMatchers([]string{"https://example.com/cluster-presence"}), nil)
+	require.NoError(t, hubB.AddSubscriber(context.Background(), subB))
+
+	// Force an immediate presence write: noHeartbeatInterval keeps the
+	// heartbeat from publishing within the test.
+	hubA.publishPresence(context.Background())
+	hubB.publishPresence(context.Background())
+
+	_, subs, err := hubB.GetSubscribers(context.Background())
+	require.NoError(t, err)
+	assert.Len(t, subs, 2,
+		"hub B's GetSubscribers must enumerate both hubs' subscribers via ClusterClient.Scan")
+}
+
+// realRedisClusterTLSAddrs returns the TLS-port equivalents of the plain
+// addresses (port + 1000), respecting REDIS_CLUSTER_TLS_ADDRS for override.
+func realRedisClusterTLSAddrs(plainAddrs []string) []string {
+	if env := os.Getenv("REDIS_CLUSTER_TLS_ADDRS"); env != "" {
+		parts := strings.Split(env, ",")
+		out := make([]string, 0, len(parts))
+
+		for _, p := range parts {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+
+		return out
+	}
+
+	out := make([]string, 0, len(plainAddrs))
+
+	for _, a := range plainAddrs {
+		// Convention from compose.cluster.yaml: TLS port = plain port + 1000.
+		// Mechanical translation rather than re-parsing host:port pairs.
+		out = append(out, strings.Replace(a, ":7", ":8", 1))
+	}
+
+	return out
+}
+
+// TestReal_Cluster_TLSEndToEnd verifies the transport over a real cluster's
+// TLS ports (8000-8002) with `InsecureSkipVerify`, the pattern
+// docs/configuration.md documents for clusters whose nodes do not share a SAN.
+func TestReal_Cluster_TLSEndToEnd(t *testing.T) {
+	plainAddrs := probeRealRedisCluster(t)
+	tlsAddrs := realRedisClusterTLSAddrs(plainAddrs)
+
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:       tlsAddrs,
+		DialTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second,
+		// The compose stack's self-signed cert has SAN=IP:127.0.0.1.
+		TLSConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // self-signed test fixture; pattern matches documented production guidance
+	})
+
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		t.Skipf("TLS cluster plane not reachable (compose.cluster.yaml may need a refresh): %v", err)
+	}
+
+	transport, streamName := buildRealTransport(t, client)
+
+	t.Cleanup(func() {
+		_ = transport.Close(context.Background())
+
+		cleanupClusterStreamKeys(client, streamName)
+
+		_ = client.Close()
+	})
+
+	tss := testTopicMatcherStore()
+	sub := mercure.NewLocalSubscriber("", testLogger(), tss)
+	sub.SetMatchers(topicMatchers([]string{"https://example.com/cluster-tls"}), nil)
+
+	require.NoError(t, transport.AddSubscriber(context.Background(), sub))
+
+	require.NoError(t, transport.Dispatch(context.Background(), &mercure.Update{
+		Topics: []string{"https://example.com/cluster-tls"},
+		Data:   "hello tls cluster",
+	}))
+
+	select {
+	case msg := <-sub.Receive():
+		assert.Equal(t, "hello tls cluster", msg.Data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for message from TLS cluster")
+	}
+}
+
+// TestReal_Cluster_HistoryReplay verifies that XRANGE-driven history replay
+// works through cluster slot routing. Publish N events, then add a
+// subscriber with last-event-ID = first event's ID; the subscriber must
+// receive events 2..N. This mirrors the single-node pagination tests and
+// confirms that XRANGE works on cluster topology. The hash-tag invariant
+// puts `{streamName}` on a single primary, so XRANGE behaves as it does on
+// a single node.
+func TestReal_Cluster_HistoryReplay(t *testing.T) {
+	transport, client := newRealClusterTransport(t)
+
+	const total = 10
+
+	publishedIDs := make([]string, 0, total)
+
+	for i := range total {
+		u := &mercure.Update{
+			Topics: []string{"https://example.com/cluster-history"},
+			Data:   fmt.Sprintf("msg-%02d", i),
+		}
+		require.NoError(t, transport.Dispatch(context.Background(), u))
+
+		publishedIDs = append(publishedIDs, u.ID)
+	}
+
+	// Wait for the listener to have processed everything before AddSubscriber
+	// snapshots toStreamID. Otherwise Pass 1 (scanForEventID) sees a stale
+	// tail and Pass 2 (replayAll) fires.
+	waitForStreamCatchUp(t, transport, client)
+
+	tss := testTopicMatcherStore()
+	sub := mercure.NewLocalSubscriber(publishedIDs[0], testLogger(), tss)
+	sub.SetMatchers(topicMatchers([]string{"https://example.com/cluster-history"}), nil)
+
+	require.NoError(t, transport.AddSubscriber(context.Background(), sub))
+
+	expected := total - 1 // every event after the first
+	received := make([]string, 0, expected)
+
+	for range expected {
+		select {
+		case msg := <-sub.Receive():
+			received = append(received, msg.Data)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out after %d/%d replayed events", len(received), expected)
+		}
+	}
+
+	for i, data := range received {
+		assert.Equal(t, fmt.Sprintf("msg-%02d", i+1), data,
+			"replay sequence broken at index %d", i)
+	}
+}
+
+// TestReal_Cluster_XTRIMMinID verifies that XTRIM MINID-driven TTL cleanup
+// works through cluster slot routing. Same invariant as the single-node
+// test: the XTRIM call reaches the owner of the {streamName} slot through
+// cluster routing.
+func TestReal_Cluster_XTRIMMinID(t *testing.T) {
+	transport, client := newRealClusterTransport(t, WithEventTTL(10*time.Millisecond))
+
+	for i := range 5 {
+		require.NoError(t, transport.Dispatch(context.Background(), &mercure.Update{
+			Topics: []string{"https://example.com/cluster-trim"},
+			Data:   fmt.Sprintf("msg-%d", i),
+		}))
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	transport.trimByTTL(context.Background())
+
+	length, err := client.XLen(context.Background(), "{"+transport.opts.streamName+"}").Result()
+	require.NoError(t, err)
+	assert.Zero(t, length, "XTRIM MINID through cluster routing should drop all entries older than eventTTL")
+}
+
+// TestRealStress_Cluster_ConcurrentAddDispatchRemoveClose mirrors the
+// single-node stress test but against a ClusterClient. go-redis's
+// connection pool, cross-slot routing, and topology-refresh paths
+// behave differently under load than standalone clients. This test
+// catches regressions where those paths interact badly with the
+// transport's internal locking and shutdown sequence.
+func TestRealStress_Cluster_ConcurrentAddDispatchRemoveClose(t *testing.T) {
+	transport, _ := newRealClusterTransport(t, WithDispatchShards(4))
+	runConcurrentStressLoop(t, transport)
+}
+
+// TestReal_Cluster_ZombieGC verifies that orphan-group cleanup works
+// against cluster topology. Creates a synthetic zombie consumer group
+// whose owning node's presence key does not exist. The GC passes
+// (reclaimZombieGroup) must destroy it through the destroy script, which
+// runs on the stream's primary.
+func TestReal_Cluster_ZombieGC(t *testing.T) {
+	transport, client := newRealClusterTransport(t, WithZombieGCInterval(24*time.Hour))
+
+	streamKey := "{" + transport.opts.streamName + "}"
+
+	require.NoError(t, transport.Dispatch(context.Background(), &mercure.Update{
+		Topics: []string{"https://example.com/cluster-zombie"},
+		Data:   "bootstrap",
+	}))
+
+	require.NoError(t, client.XGroupCreate(context.Background(), streamKey,
+		"mercure:node:zombie-cluster-test-node", "0").Err())
+
+	reclaimZombieGroup(t, transport, streamKey, "mercure:node:zombie-cluster-test-node")
+
+	groups, err := client.XInfoGroups(context.Background(), streamKey).Result()
+	require.NoError(t, err)
+
+	for _, g := range groups {
+		assert.NotEqual(t, "mercure:node:zombie-cluster-test-node", g.Name,
+			"zombie group should have been destroyed via the destroy script")
+	}
+}
+
+// TestReal_Cluster_GetSubscribersIsolatedPerStream verifies that glob
+// characters or "}:presence:" in a stream name neither leak another stream's
+// subscribers nor hide the stream's own. ClusterClient routes the presence
+// SCAN by the hash tag of its MATCH pattern, and the escaping changes that
+// tag. The SCAN must therefore be sent to the primary that owns the stream.
+func TestReal_Cluster_GetSubscribersIsolatedPerStream(t *testing.T) {
+	addrs := probeRealRedisCluster(t)
+	ctx := context.Background()
+
+	newClient := func() *redis.ClusterClient {
+		return redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:       addrs,
+			DialTimeout: 2 * time.Second,
+			ReadTimeout: 2 * time.Second,
+		})
+	}
+
+	admin := newClient()
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	// Pick a prefix for which at least one name's escaped pattern hashes to a
+	// different primary than the stream's keys. Otherwise the test could not
+	// tell a SCAN pinned to the stream's primary from an unpinned one.
+	movesToOtherPrimary := func(prefix string) bool {
+		for _, name := range isolatedStreamNames {
+			own, err := admin.MasterForKey(ctx, key(prefix+name, ""))
+			require.NoError(t, err)
+
+			byPattern, err := admin.MasterForKey(ctx, key(escapeRedisGlob(prefix+name), ":presence:*"))
+			require.NoError(t, err)
+
+			if own.Options().Addr != byPattern.Options().Addr {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	start := time.Now().UnixNano()
+	prefix := ""
+
+	for i := range 50 {
+		if candidate := fmt.Sprintf("mercure-it-glob-%d-%d-", start, i); movesToOtherPrimary(candidate) {
+			prefix = candidate
+
+			break
+		}
+	}
+
+	require.NotEmpty(t, prefix, "no prefix routes an escaped pattern to another primary")
+	t.Cleanup(func() { deleteIsolatedStreams(admin, prefix) })
+
+	assertPresenceIsolatedPerStream(t, prefix, func(stream string) *RedisTransport {
+		return newStreamTransport(t, newClient(), stream)
+	})
+}
+
+// failFirstScanHook fails the first SCAN after it is armed with io.EOF, a
+// transient error go-redis retries.
+type failFirstScanHook struct {
+	armed  atomic.Bool
+	failed atomic.Int32
+}
+
+func (*failFirstScanHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *failFirstScanHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "scan" && h.armed.CompareAndSwap(true, false) {
+			h.failed.Add(1)
+			cmd.SetErr(io.EOF)
+
+			return io.EOF
+		}
+
+		return next(ctx, cmd)
+	}
+}
+
+func (*failFirstScanHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestReal_Cluster_PresenceScanKeepsClusterRetries verifies that a plain
+// stream name's presence SCAN goes through the ClusterClient, so a transient
+// error on the node is retried instead of failing GetSubscribers.
+func TestReal_Cluster_PresenceScanKeepsClusterRetries(t *testing.T) {
+	addrs := probeRealRedisCluster(t)
+	stream := fmt.Sprintf("mercure-it-scan-retry-%d", time.Now().UnixNano())
+
+	admin := redis.NewClusterClient(&redis.ClusterOptions{Addrs: addrs, DialTimeout: 2 * time.Second})
+
+	t.Cleanup(func() { _ = admin.Close() })
+	t.Cleanup(func() { _ = admin.Del(context.Background(), key(stream, "")).Err() })
+
+	client := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs:       addrs,
+		DialTimeout: 2 * time.Second,
+		ReadTimeout: 2 * time.Second,
+	})
+	hook := &failFirstScanHook{}
+
+	client.OnNewNode(func(node *redis.Client) { node.AddHook(hook) })
+
+	transport := newStreamTransport(t, client, stream)
+
+	hook.armed.Store(true)
+
+	_, _, err := transport.GetSubscribers(context.Background())
+	require.NoError(t, err, "the ClusterClient must retry the SCAN after a transient node error")
+	assert.EqualValues(t, 1, hook.failed.Load(), "the hook must have failed one SCAN")
+}

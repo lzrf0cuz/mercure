@@ -56,6 +56,13 @@ func (t *LocalTransport) AddSubscriber(ctx context.Context, s *LocalSubscriber) 
 	t.Lock()
 	defer t.Unlock()
 
+	// Close may have finished its disconnect walk since the check above.
+	select {
+	case <-t.closed:
+		return ErrClosedTransport
+	default:
+	}
+
 	t.subscribers.Add(s)
 
 	if s.RequestLastEventIDSet {

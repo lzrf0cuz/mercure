@@ -1,19 +1,14 @@
 version: "2"
 run:
   tests: true
-  # Match the tags the released binaries are built with (see .goreleaser.yml),
-  # so the code that ships is the code that gets linted.
-  build-tags:
-    - deprecated_transport
-    - deprecated_topic
-    - deprecated_claim
-    - nobadger
-    - nomysql
-    - nopgx
+  # Build tags come from the caller, not this file: `--build-tags` adds to a
+  # list set here instead of replacing it. Taskfile.yml passes `--build-tags`
+  # (go:lint, go:lint:dev); CI sets them through env.GOFLAGS.
 linters:
   default: all
   settings:
     gomoddirectives:
+      # caddy/go.mod needs local replace directives for the in-tree modules.
       replace-local: true
     ireturn:
       allow:
@@ -23,6 +18,11 @@ linters:
         - stdlib
         - generic
         - go.opentelemetry.io/otel/trace.Span
+        # NewCodec returns one of three concrete codecs through the interface.
+        - github.com/dunglas/mercure.Codec
+        # The Caddy module's Transport interface (caddy/transport.go) requires
+        # GetTransport to return it, so every transport module does.
+        - github.com/dunglas/mercure.Transport
     spancheck:
       extra-start-span-signatures:
         - "github.com/dunglas/mercure.startSpan:opentelemetry"
@@ -34,7 +34,10 @@ linters:
     - exhaustruct
     - exhaustruct_v5
     - forcetypeassert
+    # gomodguard is deprecated since v2.12.0 (replaced by gomodguard_v2);
+    # we don't restrict module imports, so disable both rather than migrate.
     - gomodguard
+    - gomodguard_v2
     - intrange
     - lll
     - mnd
@@ -70,6 +73,28 @@ linters:
           # .github/workflows/lint.yml.
           - dupl
         path: _test\.go
+      # upstreamVersion is a link-time -X target (Taskfile.yml, Dockerfile), so it has to be a
+      # package-level var. The linter's built-in exemptions (`version`, `_`, `Err*` error vars,
+      # regexp.MustCompile results, embed vars) do not cover it.
+      - linters:
+          - gochecknoglobals
+        path: ^version\.go$
+        text: upstreamVersion
+      # The fork builds without deprecated_transport, so golangci-lint sees
+      # upstream's `!deprecated_transport` stub and the stub-only `unused`
+      # report on caddy/mercure.go's deprecatedTransport field. Remove both
+      # rules when upstream drops the deprecated transport.
+      - linters:
+          - ireturn
+          - nilnil
+          - revive
+          - staticcheck
+          - unused
+        path: caddy/mercure_notdeprecated_transport\.go
+      - linters:
+          - unused
+        path: caddy/mercure\.go
+        text: field deprecatedTransport is unused
     paths:
       - third_party$
       - builtin$

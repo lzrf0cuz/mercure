@@ -20,10 +20,15 @@ type Transport interface {
 	// fields into subscribers' streams (CWE-93). Hub-internal updates such as
 	// subscription events are trusted and skip Validate (they use reserved
 	// topics that Validate rejects by design).
+	// A transport re-reading updates from an external store must reject updates failing ValidateSSEFields.
 	Dispatch(ctx context.Context, u *Update) error
 
 	// AddSubscriber adds a new subscriber to the transport.
 	// It must call s.HistoryDispatched exactly once when s.RequestLastEventIDSet is true, even for an empty RequestLastEventID: the subscribe handler blocks on it before sending headers.
+	//
+	// On error the transport may already have listed s. The caller still
+	// disconnects s and calls RemoveSubscriber for it (the hub does), so
+	// RemoveSubscriber must accept a subscriber whose add failed.
 	AddSubscriber(ctx context.Context, s *LocalSubscriber) error
 
 	// RemoveSubscriber removes a subscriber from the transport.
@@ -59,7 +64,28 @@ type TransportHealthChecker interface {
 	Live(ctx context.Context) error
 }
 
-// ErrClosedTransport is returned by the Transport's Dispatch and AddSubscriber methods after a call to Close.
+// TransportCodec provides a method to pass the Codec to the transport.
+//
+// NewHub calls SetCodec at most once, and only when the hub was configured
+// with a non-nil codec through WithCodec. Otherwise SetCodec is never called,
+// and the transport keeps whatever codec it already has: its own default,
+// unless an earlier hub already called SetCodec on it (see below).
+//
+// The hub makes no ordering guarantee between SetCodec and the transport's
+// other methods: a host may reuse a live transport across hubs (Caddy's usage
+// pool keeps a transport across config reloads), so SetCodec can run while an
+// earlier hub is still dispatching, and each new hub may call it again.
+// Implementations that read the codec from other goroutines must publish it
+// safely (e.g. with sync/atomic or a sync.Mutex).
+type TransportCodec interface {
+	SetCodec(codec Codec)
+}
+
+// ErrClosedTransport is returned after a call to Close by the Transport's
+// Dispatch, AddSubscriber and RemoveSubscriber methods. A transport that
+// implements TransportSubscribers, Admitter or TransportHealthChecker may also
+// return it from GetSubscribers, TryAdmit, Ready and Live. Test for it with
+// errors.Is: a transport may return its own error that wraps it.
 var ErrClosedTransport = errors.New("hub: read/write on closed Transport")
 
 // TransportError is returned when the Transport's DSN is invalid.

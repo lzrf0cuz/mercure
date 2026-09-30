@@ -30,7 +30,7 @@ jobs:
             anonymous
             cors_origins *
         options: >-
-          --health-cmd "wget -q -O /dev/null http://localhost:2019/mercure/health/ready"
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:2019/mercure/health/ready"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
