@@ -30,6 +30,8 @@ All variables are optional.
 | `HUB_URL`                                       | URL of the hub to test.                                                                       |
 | `JWT`                                           | Publisher JWT.                                                                                |
 | `SUBSCRIBER_JWT`                                | Subscriber JWT. Falls back to `JWT` when private updates are tested.                          |
+| `SUBSCRIBER_HEADERS`                            | Extra headers for subscribe requests only. See [below](#extra-request-headers).               |
+| `PUBLISHER_HEADERS`                             | Extra headers for publish requests only. See [below](#extra-request-headers).                 |
 | `INITIAL_SUBSCRIBERS`                           | Concurrent subscribers connected at the start.                                                |
 | `SUBSCRIBERS_RATE_FROM` / `SUBSCRIBERS_RATE_TO` | Range for additional subscriber connection rate (per second).                                 |
 | `PUBLISHERS_RATE_FROM` / `PUBLISHERS_RATE_TO`   | Range for publication rate (per second).                                                      |
@@ -37,6 +39,20 @@ All variables are optional.
 | `CONNECTION_DURATION`                           | How long subscribers stay connected.                                                          |
 | `RANDOM_CONNECTION_DURATION`                    | Boolean (`true` by default); randomize subscriber lifetime below `CONNECTION_DURATION`.       |
 | `PRIVATE_UPDATES`                               | Set `true` for private updates; defaults to `false`.                                          |
+| `SUBSCRIBE_PARAM`                               | Overrides the subscribe query parameter, e.g. `match=https://example.com`.                    |
+| `PUBLISH_TOPIC`                                 | Overrides the published topic; it must match the subscriber's matcher.                        |
+
+### Extra request headers
+
+`SUBSCRIBER_HEADERS` adds extra request headers to subscribe requests, and `PUBLISHER_HEADERS` adds them to publish requests. Each variable applies to its own request only: subscribe requests never carry `PUBLISHER_HEADERS`, and publish requests never carry `SUBSCRIBER_HEADERS`. Use them, for example, to send the header a [claim binding](../deployment/configuration.md#claim-bindings) requires.
+
+Both variables use the same format. Write `Name: value` pairs separated by newlines or `;`. Each pair is split on its first `:`, so values may contain `:` but not `;`. Names and values are trimmed, and blank entries are ignored. When unset or empty, no header is added.
+
+The test refuses to start if an entry in either variable has no `:` or an empty name. It also refuses an `Authorization` entry: the subscriber token comes from `SUBSCRIBER_JWT` (or `JWT` when `PRIVATE_UPDATES` is set) and the publisher token from `JWT`, not from these variables.
+
+```console
+SUBSCRIBER_HEADERS='Group-ID: red' PUBLISHER_HEADERS='Group-ID: red; X-Other-Header: other' ./mvnw gatling:test
+```
 
 Start below your expected traffic and increase the load while measuring latency and errors:
 

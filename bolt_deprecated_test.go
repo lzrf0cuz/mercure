@@ -14,12 +14,12 @@ import (
 func TestNewBoltTransport(t *testing.T) {
 	t.Parallel()
 
-	u, _ := url.Parse("bolt://test-" + t.Name() + ".db?bucket_name=demo")
+	// ToSlash gives the path the URL form, whatever the OS separator.
+	u, _ := url.Parse("bolt://" + filepath.ToSlash(filepath.Join(t.TempDir(), "test.db")) + "?bucket_name=demo")
 	transport, err := DeprecatedNewBoltTransport(u, nil)
 	require.NoError(t, err)
 	require.NotNil(t, transport)
 	require.NoError(t, transport.Close(t.Context()))
-	require.NoError(t, os.Remove("test-"+t.Name()+".db"))
 
 	u, _ = url.Parse("bolt://")
 	_, err = DeprecatedNewBoltTransport(u, nil)

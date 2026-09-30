@@ -1,6 +1,8 @@
 package caddy
 
 import (
+	"fmt"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/dunglas/mercure"
@@ -8,6 +10,14 @@ import (
 
 type localTransportKey struct {
 	hub string
+}
+
+// localDestructor keeps the subscriber list cache size the pooled transport
+// was created with.
+type localDestructor struct {
+	TransportDestructor[*mercure.LocalTransport]
+
+	subscriberListCacheSize int
 }
 
 func init() { //nolint:gochecknoinits
@@ -34,16 +44,23 @@ func (l *Local) GetTransport() mercure.Transport { //nolint:ireturn
 // Provision provisions l's configuration.
 func (l *Local) Provision(ctx caddy.Context) error {
 	l.key = localTransportKey{hubName(ctx)}
+	cacheSize := ctx.Value(SubscriberListCacheSizeContextKey).(int)
 
-	destructor, _, _ := TransportUsagePool.LoadOrNew(l.key, func() (caddy.Destructor, error) {
-		return TransportDestructor[*mercure.LocalTransport]{
-			Transport: mercure.NewLocalTransport(
-				mercure.NewSubscriberList(ctx.Value(SubscriberListCacheSizeContextKey).(int)),
-			),
+	destructor, loaded, _ := TransportUsagePool.LoadOrNew(l.key, func() (caddy.Destructor, error) {
+		return localDestructor{
+			TransportDestructor[*mercure.LocalTransport]{Transport: mercure.NewLocalTransport(mercure.NewSubscriberList(cacheSize))},
+			cacheSize,
 		}, nil
 	})
 
-	l.transport = destructor.(TransportDestructor[*mercure.LocalTransport]).Transport
+	// On failure, Caddy calls Cleanup, which releases the pooled transport.
+	pooled := destructor.(localDestructor)
+	if loaded && pooled.subscriberListCacheSize != cacheSize {
+		return fmt.Errorf("the local transport of hub %q is %w (subscriber_list_cache_size %d -> %d): restart Caddy to change them; a reload keeps the running transport",
+			l.key.hub, errTransportOptionsChanged, pooled.subscriberListCacheSize, cacheSize)
+	}
+
+	l.transport = pooled.Transport
 
 	return nil
 }
