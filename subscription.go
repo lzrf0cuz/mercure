@@ -1,7 +1,9 @@
 package mercure
 
 import (
+	"context"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,8 +11,22 @@ import (
 	"strings"
 
 	"github.com/gorilla/mux"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// ErrTooManySubscribers is returned by a transport's GetSubscribers when the
+// subscriber list exceeds what it is configured to materialize, rather than
+// build a response large enough to exhaust the hub's memory. The subscription
+// API answers it with 503. Test for it with errors.Is.
+var ErrTooManySubscribers = errors.New("too many subscribers to list")
+
+// errTransportDoesNotSupportSubscribers is recorded when the subscription API
+// is invoked with a transport that does not implement TransportSubscribers.
+// The handler's routes are only registered for one that does (see
+// registerSubscriptionHandlers), so this is reached only by invoking the
+// handlers directly.
+var errTransportDoesNotSupportSubscribers = errors.New("transport does not implement TransportSubscribers")
 
 const (
 	subscriptionsPath = "/subscriptions"
@@ -253,7 +269,7 @@ func (h *Hub) authorizeSubscriptionRequest(span trace.Span, w http.ResponseWrite
 		return true
 	}
 
-	claims, err := h.authorize(r, false)
+	claims, err := h.authorizeAndBind(r, false)
 	if err != nil || claims == nil {
 		h.writeAuthError(w, r, err)
 
@@ -276,6 +292,28 @@ func (h *Hub) authorizeSubscriptionRequest(span trace.Span, w http.ResponseWrite
 	return true
 }
 
+// writeGetSubscribersError answers and logs a failed GetSubscribers. A list
+// larger than the transport will build is unavailable, not an internal error:
+// 503. Anything else, a closed transport included, is a 500.
+func (h *Hub) writeGetSubscribersError(ctx context.Context, w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, ErrTooManySubscribers) {
+		status = http.StatusServiceUnavailable
+	}
+
+	http.Error(w, http.StatusText(status), status)
+
+	// A closed transport is shutting down, not failing: Debug.
+	level := slog.LevelError
+	if errors.Is(err, ErrClosedTransport) {
+		level = slog.LevelDebug
+	}
+
+	if h.logger.Enabled(ctx, level) {
+		h.logger.LogAttrs(ctx, level, "Error retrieving subscribers", slog.Any("error", err))
+	}
+}
+
 func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span trace.Span, currentURL string, subscribers []*Subscriber, ok bool) {
 	ctx, span := startSpan(r.Context(), "mercure.subscriptions", trace.WithSpanKind(trace.SpanKindInternal))
 	// The topic to authorize (and the collection id) is the absolute path in
@@ -290,17 +328,21 @@ func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span tra
 
 	transport, isSubTransport := h.transport.(TransportSubscribers)
 	if !isSubTransport {
-		panic("The transport isn't an instance of hub.TransportSubscribers")
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+
+		if h.logger.Enabled(ctx, slog.LevelError) {
+			h.logger.LogAttrs(ctx, slog.LevelError, "Subscription API invoked with a transport that does not support it", slog.Any("error", errTransportDoesNotSupportSubscribers))
+		}
+
+		span.SetAttributes(attribute.String("error.type", "transport_does_not_support_subscribers"))
+		recordSpanError(span, errTransportDoesNotSupportSubscribers)
+
+		return span, "", nil, false
 	}
 
 	lastEventID, subscribers, err := transport.GetSubscribers(ctx)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-
-		if h.logger.Enabled(ctx, slog.LevelError) {
-			h.logger.LogAttrs(ctx, slog.LevelError, "Error retrieving subscribers", slog.Any("error", err))
-		}
-
+		h.writeGetSubscribersError(ctx, w, err)
 		recordSpanError(span, err)
 
 		return span, currentURL, subscribers, false
@@ -321,6 +363,11 @@ func (h *Hub) initSubscription(w http.ResponseWriter, r *http.Request) (span tra
 
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
+
+		// A 304 leaves the span status unset, as for any non-5xx answer (OTel
+		// HTTP semantic conventions), so this attribute is what tells an
+		// ETag-served request apart.
+		span.SetAttributes(attribute.Bool("mercure.subscriptions.cache_hit", true))
 
 		return span, "", nil, false
 	}

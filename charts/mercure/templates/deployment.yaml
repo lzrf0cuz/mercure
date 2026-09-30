@@ -166,9 +166,11 @@ spec:
             {{- toYaml .Values.extraEnvs | nindent 12 }}
           {{- end }}
           # /data, /config, /tmp are always mounted so the chart works under
-          # `readOnlyRootFilesystem: true` whatever the transport. Caddy writes
-          # its autosave config to /config (XDG_CONFIG_HOME) and its instance
-          # UUID + module data to /data (`caddy.AppDataDir()`); both must be
+          # `readOnlyRootFilesystem: true` whatever the transport. /config is
+          # Caddy's configuration directory (XDG_CONFIG_HOME): the bundled
+          # Caddyfiles set `persist_config off`, so they write no autosave.json
+          # there, but a custom Caddyfile without it would. Caddy writes its
+          # instance UUID + module data to /data (`caddy.AppDataDir()`); both must be
           # writable for any module that uses storage (e.g. `rate_limit`).
           # /data is the PVC when `persistence.enabled`, otherwise an emptyDir.
           volumeMounts:

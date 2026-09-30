@@ -18,7 +18,7 @@ When the hub receives a shutdown signal (`SIGTERM`, the Caddy admin `/stop` endp
 
 The hub randomizes connection deadlines between 80% and 100% of `write_timeout` (480 to 600 seconds by default). During shutdown, existing connections use those deadlines. This spreads reconnections, although the distribution still depends on when clients connected.
 
-With `write_timeout 0s`, the hub closes subscribers immediately on shutdown.
+With `write_timeout 0s`, only a token's `exp` sets a connection-expiry timer. In the default mode a token without `exp` is rejected with `401`, so the subscriber with no timer is the anonymous one; with `protocol_version_compatibility` on a `deprecated_claim` build, `exp` is optional and a token without it has no timer either. The `dispatch_timeout` deadline only bounds a write in progress. The hub still closes every subscriber immediately on shutdown, and on every applied config reload, even a forced reload of an unchanged config, so shutdown does not wait for token expiry or hang indefinitely.
 
 ## Sizing the drain window
 
@@ -27,6 +27,8 @@ The orchestrator must allow enough time between `SIGTERM` and `SIGKILL`; otherwi
 **The rule:** `stop timeout >= write_timeout + small margin`.
 
 For the default `write_timeout 600s`, a 660s grace period is the right starting point. If you bump `write_timeout`, bump the orchestrator's grace period to match.
+
+The Caddyfiles bundled with the images built from this repository set Caddy's `grace_period 10s`: on shutdown or reload they close the remaining SSE streams after 10 seconds, and clients reconnect and, with a transport that keeps history, resume with `Last-Event-ID`. For a full drain, raise it through `GLOBAL_OPTIONS` (for example `grace_period 11m`) or in a custom Caddyfile.
 
 ## Kubernetes
 

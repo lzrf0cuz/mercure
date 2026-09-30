@@ -43,6 +43,7 @@
 - [Mercure high availability](https://mercure.rocks/docs/production/high-availability): Self-Hosted Redis, PostgreSQL, Kafka, and Pulsar transports for multi-node Mercure.
 - [Rolling updates and graceful shutdown](https://mercure.rocks/docs/production/rolling-updates): Drain SSE connections cleanly during deploys.
 - [Health checks and monitoring](https://mercure.rocks/docs/production/health-monitoring): Transport-aware probes, Prometheus metrics, alerts, dashboards.
+- [Metrics reference](https://github.com/lzrf0cuz/mercure/blob/fork/main/docs/production/metrics.md): Every `mercure_*` Prometheus series with its type, labels, and what increments it.
 - [Tracing](https://mercure.rocks/docs/production/tracing): OpenTelemetry spans for publish, subscribe, and history operations.
 - [Load testing the Mercure hub](https://mercure.rocks/docs/production/load-testing): Gatling-based load test for capacity and bottleneck analysis.
 - [Debugging the Mercure hub](https://mercure.rocks/docs/production/debugging): pprof CPU, heap, goroutine, and trace profiles.

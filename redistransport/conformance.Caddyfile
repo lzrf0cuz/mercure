@@ -1,0 +1,72 @@
+# Caddyfile for running conformance tests against the Redis transport.
+#
+# Intentionally rigid — JWT secret, server name, and JWT algorithm are
+# hardcoded so the Playwright suite stays reproducible. A stale env var
+# silently changing one of these would break tests in confusing ways.
+# For ad-hoc dev work, use `redis-test.Caddyfile` (env-overridable) instead.
+#
+# This config matches what conformance-tests/mercure.spec.ts expects:
+#   - HTTPS on localhost (self-signed)
+#   - Anonymous subscriptions enabled
+#   - Trusted issuer https://localhost, HS256 with the key of the hardcoded
+#     conformance test token
+#   - Hub endpoint at /.well-known/mercure
+#
+# Usage:
+#   1. Start Redis:  docker run -d -p 6379:6379 redis:7-alpine
+#   2. Build:        cd caddy/mercure && go build -tags="nobadger,nomysql,nopgx" -o mercure
+#   3. Run:          ./mercure run -c ../../redistransport/conformance.Caddyfile
+#   4. Test:         cd conformance-tests && npx playwright test
+#
+# The JWT secret below matches the hardcoded access token in mercure.spec.ts
+# (typ at+jwt, iss https://localhost, aud https://localhost/.well-known/mercure),
+# which is signed with the HS256 key:
+#   !ChangeThisMercureHubJWTSecretKey!
+#
+# Health endpoints (via Caddy admin API at localhost:2019):
+#   http://localhost:2019/mercure/health/{ready,live}
+#   http://localhost:2019/mercure/health/conformance/{ready,live}
+{
+	skip_install_trust
+
+	# Served with `-c <file>` and never `--resume`: autosave.json would be
+	# written and never read.
+	persist_config off
+}
+
+localhost {
+	log
+
+	# Compress responses except the Mercure hub endpoint (SSE streams + publish API).
+	@static {
+		not path /.well-known/mercure
+	}
+	encode @static zstd gzip
+
+	mercure {
+		# Per-hub health endpoint label: /mercure/health/{name}/{ready,live}
+		name {$MERCURE_HUB_NAME:conformance}
+
+		anonymous
+		subscriptions
+
+		issuer https://localhost {
+			publisher {
+				jwt !ChangeThisMercureHubJWTSecretKey! HS256
+			}
+			subscriber {
+				jwt !ChangeThisMercureHubJWTSecretKey! HS256
+			}
+		}
+
+		transport redis {
+			url redis://localhost:6379
+			stream mercure-conformance
+			max_length 10000
+			encoding json
+		}
+	}
+
+	redir / /.well-known/mercure/debug/ 302
+	respond "Mercure Hub (Redis transport — conformance)" 404
+}

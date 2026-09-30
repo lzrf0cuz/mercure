@@ -7,14 +7,26 @@ retract (
 	v0.14.6 // Overwritten tag
 )
 
+// The caddy module builds against the hub root and both transport modules
+// in-tree; run `go mod tidy` in all four modules when dependencies change.
 replace github.com/dunglas/mercure => ../
+
+replace github.com/lzrf0cuz/mercure/redistransport => ../redistransport
+
+replace github.com/lzrf0cuz/mercure/redistransport/caddy => ../redistransport/caddy
 
 require (
 	github.com/MicahParks/keyfunc/v3 v3.8.2
+	github.com/alicebob/miniredis/v2 v2.37.0
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/dunglas/mercure v1.0.2
 	github.com/dustin/go-humanize v1.1.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/lzrf0cuz/mercure/redistransport v0.0.0
+	github.com/lzrf0cuz/mercure/redistransport/caddy v0.0.0-00010101000000-000000000000
+	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.3
+	github.com/redis/go-redis/v9 v9.18.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.etcd.io/bbolt v1.5.0
@@ -57,6 +69,7 @@ require (
 	github.com/dgraph-io/badger/v2 v2.2007.4 // indirect
 	github.com/dgraph-io/ristretto v0.2.0 // indirect
 	github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dlclark/regexp2/v2 v2.8.0 // indirect
 	github.com/dunglas/go-urlpattern v1.0.0 // indirect
 	github.com/dunglas/skipfilter v1.2.0 // indirect
@@ -69,6 +82,7 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-sql-driver/mysql v1.10.1 // indirect
+	github.com/gofrs/uuid/v5 v5.5.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/cel-go v0.28.1 // indirect
@@ -106,8 +120,6 @@ require (
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pires/go-proxyproto v0.15.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.24.1 // indirect
-	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.71.0 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
@@ -134,10 +146,13 @@ require (
 	github.com/tailscale/tscert v0.0.0-20251216020129-aea342f6d747 // indirect
 	github.com/unrolled/secure v1.17.0 // indirect
 	github.com/urfave/cli v1.22.17 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/yuin/goldmark v1.8.6 // indirect
 	github.com/yuin/goldmark-highlighting/v2 v2.0.0-20230729083705-37449abec8cc // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/bridges/prometheus v0.71.0 // indirect
@@ -168,6 +183,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.step.sm/crypto v0.91.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect

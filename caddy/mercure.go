@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,6 +154,13 @@ type Mercure struct {
 	// Frequency of the heartbeat, defaults to 40s.
 	Heartbeat *caddy.Duration `json:"heartbeat,omitempty"`
 
+	// Maximum duration of a single dispatch, disabled by default. Dispatch runs
+	// detached from the publisher's request. Bolt and Local ignore it; the Redis
+	// transport checks it between commands (rate limit, pool wait, retries) and
+	// also cuts a command already sent to the server. On timeout the publisher
+	// gets a 504, but the update may already be stored.
+	PublishTimeout *caddy.Duration `json:"publish_timeout,omitempty"`
+
 	// Maximum size in bytes of publish and QUERY subscribe request bodies;
 	// larger requests are rejected with a 413 status code. Defaults to 1MiB,
 	// set to 0 to disable the in-hub limit.
@@ -177,6 +186,19 @@ type Mercure struct {
 	// implicit issuer (usable only in compatibility mode).
 	SubscriberJWKSURL string `json:"subscriber_jwks_url,omitempty"`
 
+	// Bindings requiring a JWT claim to agree with an HTTP header, e.g. the "groups"
+	// claim with the "Group-ID" header. Every applicable binding must hold: a missing,
+	// empty or repeated bound header is answered with a 400, a bound claim of unusable type
+	// with a 401, and an absent or mismatched claim with a 403 (on_missing allow skips a
+	// genuinely absent header or claim).
+	ClaimHeaderBindings []ClaimHeaderBindingConfig `json:"require_claim_headers,omitempty"`
+
+	// Bindings requiring a JWT claim to hold at least one of a fixed set of values, e.g.
+	// the "groups" claim with "red" and "blue". Every applicable binding must hold:
+	// a bound claim of unusable type is answered with a 401, and an absent claim or one
+	// holding none of the values with a 403.
+	ClaimValueBindings []ClaimValueBindingConfig `json:"require_claim_values,omitempty"`
+
 	// Origins allowed to publish updates
 	PublishOrigins []string `json:"publish_origins,omitempty"`
 
@@ -188,6 +210,12 @@ type Mercure struct {
 	TopicMatcherCacheSize *int `json:"topic_matcher_cache_size,omitempty"`
 
 	SubscriberListCacheSize *int `json:"subscriber_list_cache_size,omitempty"`
+
+	// Per-subscriber out-channel capacity, which also bounds the pre-ready
+	// queue; defaults to 1000. Each connected subscriber commits this many
+	// update slots up front, so a large fleet may want it lower to cut memory.
+	// 0 keeps the default; a positive value below 16 is rejected.
+	SubscriberOutBuffer *int `json:"subscriber_out_buffer,omitempty"`
 
 	// The name of the authorization cookie. Defaults to
 	// "__Secure-mercure_access_token"; plain-HTTP deployments must configure a
@@ -237,7 +265,11 @@ func (s stoppingHandlerFunc) Handle(_ context.Context, _ caddy.Event) error {
 
 //nolint:wrapcheck
 func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,gocognit,gocyclo,maintidx
-	metrics := mercure.NewPrometheusMetrics(ctx.GetMetricsRegistry())
+	// Capture the registry before the ctx.WithValue calls below: the Context
+	// they return has no registry, and bindTransportMetrics needs this config's
+	// registry.
+	metricsRegistry := ctx.GetMetricsRegistry()
+	metrics := mercure.NewPrometheusMetrics(metricsRegistry)
 
 	m.logger = slog.New(mercure.NewSlogHandler(ctx.Slogger().Handler()))
 
@@ -298,6 +330,10 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 		transport = mod.(Transport).GetTransport()
 	}
 
+	if err := bindTransportMetrics(transport, metricsRegistry, m.logger); err != nil {
+		return err
+	}
+
 	opts := []mercure.Option{
 		mercure.WithLogger(m.logger),
 		mercure.WithTopicMatcherStore(tms),
@@ -325,6 +361,22 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	if len(issuers) > 0 {
 		opts = append(opts, mercure.WithIssuers(issuers))
+	}
+
+	bindings, err := m.claimHeaderBindings()
+	if err != nil {
+		return err
+	}
+
+	valueBindings, err := m.claimValueBindings()
+	if err != nil {
+		return err
+	}
+
+	bindings = append(bindings, valueBindings...)
+
+	if len(bindings) > 0 {
+		opts = append(opts, mercure.WithClaimHeaderBindings(bindings...))
 	}
 
 	if m.Anonymous {
@@ -359,6 +411,14 @@ func (m *Mercure) Provision(ctx caddy.Context) (err error) { //nolint:funlen,goc
 
 	if d := m.Heartbeat; d != nil {
 		opts = append(opts, mercure.WithHeartbeat(time.Duration(*d)))
+	}
+
+	if d := m.PublishTimeout; d != nil {
+		opts = append(opts, mercure.WithPublishTimeout(time.Duration(*d)))
+	}
+
+	if m.SubscriberOutBuffer != nil {
+		opts = append(opts, mercure.WithSubscriberOutBuffer(*m.SubscriberOutBuffer))
 	}
 
 	if s := m.MaxRequestBodySize; s != nil {
@@ -525,6 +585,11 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 					return err
 				}
 
+			case "publish_timeout":
+				if m.PublishTimeout, err = parseDurationParameter(d); err != nil {
+					return err
+				}
+
 			case "max_request_body_size":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -638,6 +703,22 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 
 				m.SubscriberListCacheSize = &size
 
+			case "subscriber_out_buffer":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+
+				size, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.WrapErr(err)
+				}
+
+				if size != 0 && size < mercure.MinSubscriberOutBuffer {
+					return d.Errf("subscriber_out_buffer must be 0 (use the default) or at least %d, got %d", mercure.MinSubscriberOutBuffer, size)
+				}
+
+				m.SubscriberOutBuffer = &size
+
 			case "cookie_name":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -681,6 +762,29 @@ func (m *Mercure) UnmarshalCaddyfile(d *caddyfile.Dispenser) (err error) { //nol
 				}
 
 				m.ProtocolVersionCompatibility = v
+
+			case requireClaimHeader:
+				cfg, err := parseRequireClaimHeader(d)
+				if err != nil {
+					return err
+				}
+
+				// NewHub rejects this too, but without a file:line.
+				if cfg.CountSubscribers && slices.ContainsFunc(m.ClaimHeaderBindings, func(c ClaimHeaderBindingConfig) bool { return c.CountSubscribers }) {
+					backToCountSubscribers(d)
+
+					return directiveErr(requireClaimHeader, d.Errf("option %q may be set on only one binding", countSubscribers))
+				}
+
+				m.ClaimHeaderBindings = append(m.ClaimHeaderBindings, cfg)
+
+			case requireClaimValue:
+				cfg, err := parseRequireClaimValue(d)
+				if err != nil {
+					return err
+				}
+
+				m.ClaimValueBindings = append(m.ClaimValueBindings, cfg)
 
 			default:
 				// Fail loudly: silently ignoring a typo would disable whatever
@@ -974,7 +1078,7 @@ func (m *Mercure) warnAboutWellKnownKeys(ctx context.Context) {
 // VerifierConfig that isSet reports as configured.
 func (m *Mercure) buildVerifier(ctx context.Context, c VerifierConfig, role string) (mercure.Verifier, error) { //nolint:ireturn
 	if c.JWKSURL != "" {
-		k, err := newJWKSetKeyfunc(ctx, c.JWKSURL)
+		k, err := newJWKSetKeyfunc(ctx, c.JWKSURL, m.logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve %s JWK Set: %w", role, err)
 		}
@@ -1143,25 +1247,67 @@ func (m *Mercure) playgroundTokenFunc() func(string) (string, error) {
 	}
 }
 
-var errInvalidJWKSetFileHost = errors.New(`file:// JWK Set URL host must be empty or "localhost"`)
+var (
+	errInvalidJWKSetFileHost = errors.New(`file:// JWK Set URL host must be empty or "localhost"`)
+	errRelativeJWKSetFile    = errors.New("file: JWK Set URL must name an absolute path")
+	errEmptyJWKSet           = errors.New("the JWK Set holds no key that could be decoded")
+)
 
-// newJWKSetKeyfunc builds a Keyfunc from a JWK Set URL.
+// jwksHTTPFetchTimeout bounds an HTTP(S) JWK Set's first fetch, made once per
+// verifier at config load, and each scheduled refresh, so a slow or
+// blackholing JWKS endpoint cannot hang the Caddy config load. The verifiers'
+// first fetches run one after another, so a config load can wait this long
+// for each of them. It does not bound an unknown-kid refetch (see
+// jwksOverride).
+const jwksHTTPFetchTimeout = 10 * time.Second
+
+// checkJWKSetFileURL accepts only file:///absolute/path, with the host empty
+// or "localhost".
+func checkJWKSetFileURL(u *url.URL, rawURL string) error {
+	if u.Host != "" && u.Host != "localhost" {
+		return fmt.Errorf("%w, got %q in %q; the supported form is file:///absolute/path", errInvalidJWKSetFileHost, u.Host, rawURL)
+	}
+
+	if !path.IsAbs(u.Path) {
+		return fmt.Errorf("%w, got %q; the supported form is file:///absolute/path", errRelativeJWKSetFile, rawURL)
+	}
+
+	return nil
+}
+
+// newJWKSetKeyfunc builds a Keyfunc from a JWK Set URL. Failed background
+// refreshes are logged through logger.
 //
 // file:// URLs point to a local JSON file containing a JWK Set; the file is
-// read once at provision time, so rotating the keys requires a Caddy config
-// reload. Other URLs are forwarded to keyfunc.NewDefaultCtx, which handles
-// HTTP(S) and rejects unsupported schemes.
+// read once at provision time, so rotating the keys requires a forced Caddy
+// config reload. Other URLs are forwarded to keyfunc.NewDefaultOverrideCtx
+// with jwksOverride, which handles HTTP(S) and rejects unsupported schemes.
+//
+// A hub whose key set is empty would start and then reject every token, so
+// that fails Provision instead. For HTTP(S), jwksOverride makes the first
+// fetch fail on an unreachable URL, a non-200 answer, an undecodable body or
+// invalid key, or no answer within jwksHTTPFetchTimeout (per verifier, one
+// verifier after another); checkJWKSetHasKeys then rejects a set that decoded
+// to no key (e.g. a 200 answering {} or an error object). A file:// set gets
+// the same check: it is read only once, so an empty file would leave the hub
+// rejecting every token until a reload. Because the fetch runs during
+// Provision, before any listener starts, a JWK Set served by this same Caddy
+// config cannot be loaded at startup, and caddy validate needs network access
+// to the URL.
+//
+// The URL is not redacted: keyfunc's and net/http's errors name it, so a JWK
+// Set URL must not carry credentials (see the configuration docs).
 //
 //nolint:ireturn
-func newJWKSetKeyfunc(ctx context.Context, rawURL string) (keyfunc.Keyfunc, error) {
+func newJWKSetKeyfunc(ctx context.Context, rawURL string, logger *slog.Logger) (keyfunc.Keyfunc, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid JWK Set URL %q: %w", rawURL, err)
+		return nil, fmt.Errorf("invalid JWK Set URL: %w", err)
 	}
 
 	if u.Scheme == "file" {
-		if u.Host != "" && u.Host != "localhost" {
-			return nil, fmt.Errorf("%w, got %q", errInvalidJWKSetFileHost, u.Host)
+		if err := checkJWKSetFileURL(u, rawURL); err != nil {
+			return nil, err
 		}
 
 		b, err := os.ReadFile(u.Path)
@@ -1174,10 +1320,81 @@ func newJWKSetKeyfunc(ctx context.Context, rawURL string) (keyfunc.Keyfunc, erro
 			return nil, fmt.Errorf("failed to parse JWK Set file %q: %w", u.Path, err)
 		}
 
+		if err := checkJWKSetHasKeys(ctx, k, u.Path); err != nil {
+			return nil, err
+		}
+
 		return k, nil
 	}
 
-	return keyfunc.NewDefaultCtx(ctx, []string{rawURL}) //nolint:wrapcheck
+	// ctx outlives the call: keyfunc ends its refresh goroutine when ctx is
+	// done. HTTPTimeout, not ctx, bounds the first fetch.
+	k, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{rawURL}, jwksOverride(logger))
+	if err != nil {
+		// keyfunc's error names the URL.
+		return nil, fmt.Errorf("failed to load JWK Set: %w", err)
+	}
+
+	// Nothing else names the URL here, so this error does.
+	if err := checkJWKSetHasKeys(ctx, k, rawURL); err != nil {
+		return nil, err
+	}
+
+	return k, nil
+}
+
+// checkJWKSetHasKeys fails when the loaded set holds no key jwkset could
+// decode. Such a set can still hold keys unable to verify a token (e.g. only
+// X25519 keys, or only oct keys under the asymmetric allowlist); this check
+// does not look at that. Over HTTP, jwkset replaces the store with whatever
+// the answer decoded to and skips keys of an unsupported type, so a
+// well-formed answer can leave it empty. A file:// set containing any
+// unsupported key is rejected as a whole by keyfunc.NewJWKSetJSON instead.
+func checkJWKSetHasKeys(ctx context.Context, k keyfunc.Keyfunc, source string) error {
+	keys, err := k.Storage().KeyReadAll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read JWK Set from %q: %w", source, err)
+	}
+
+	if len(keys) == 0 {
+		return fmt.Errorf("%w: %q", errEmptyJWKSet, source)
+	}
+
+	return nil
+}
+
+// jwksOverride returns the keyfunc settings for an HTTP(S) JWK Set: a failed
+// first fetch is an error, the first fetch and each scheduled refresh are
+// bounded by jwksHTTPFetchTimeout, and the set is refreshed every 5 minutes
+// instead of keyfunc's 1-hour default. A failed refresh keeps the last good
+// set and is logged through logger at Error, with the URL: a status or
+// decoding error does not name it. A refresh cancelled because the config
+// is being unloaded is not a failure and is not logged; a refresh that timed
+// out is.
+//
+// A token with an unknown kid also triggers a refetch, at most one every 5
+// minutes. It runs in the request, bounded by keyfunc's RateLimitWaitMax
+// (1 minute, rate-limit wait included), not by jwksHTTPFetchTimeout.
+func jwksOverride(logger *slog.Logger) keyfunc.Override {
+	failFast := false
+
+	return keyfunc.Override{
+		NoErrorReturnFirstHTTPReq: &failFast,
+		HTTPTimeout:               jwksHTTPFetchTimeout,
+		RefreshInterval:           5 * time.Minute,
+		RefreshErrorHandlerFunc: func(u string) func(context.Context, error) {
+			return func(ctx context.Context, err error) {
+				// Only cancellation: a deadline means the refresh timed out.
+				if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+					return
+				}
+
+				if logger.Enabled(ctx, slog.LevelError) {
+					logger.LogAttrs(ctx, slog.LevelError, "Failed to refresh the JWK Set; the last good set stays in use", slog.String("url", u), slog.Any("error", err))
+				}
+			}
+		},
+	}
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Middleware.

@@ -1,8 +1,11 @@
 package mercure
 
 import (
+	"context"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +15,9 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestSubscriptionsHandlerAccessDenied(t *testing.T) {
@@ -374,4 +380,165 @@ func TestEscapeSubscriptionSegmentRoundTrip(t *testing.T) {
 	got, err := url.PathUnescape("foo+bar")
 	require.NoError(t, err)
 	assert.Equal(t, "foo+bar", got)
+}
+
+var errGetSubscribers = errors.New("forced GetSubscribers failure")
+
+// getSubscribersErrorTransport is a LocalTransport whose GetSubscribers fails with err.
+type getSubscribersErrorTransport struct {
+	*LocalTransport
+
+	err error
+}
+
+func (t *getSubscribersErrorTransport) GetSubscribers(context.Context) (string, []*Subscriber, error) {
+	return "", nil, t.err
+}
+
+// nonSubscribersTransport implements Transport but not TransportSubscribers.
+type nonSubscribersTransport struct{}
+
+func (*nonSubscribersTransport) Dispatch(context.Context, *Update) error { return nil }
+
+func (*nonSubscribersTransport) AddSubscriber(context.Context, *LocalSubscriber) error { return nil }
+
+func (*nonSubscribersTransport) RemoveSubscriber(context.Context, *LocalSubscriber) error {
+	return nil
+}
+
+func (*nonSubscribersTransport) Close(context.Context) error { return nil }
+
+// subscriptionsSpan returns the ended mercure.subscriptions span.
+func subscriptionsSpan(t *testing.T, sr *tracetest.SpanRecorder) tracetest.SpanStub {
+	t.Helper()
+
+	for _, s := range sr.Ended() {
+		if s.Name() == "mercure.subscriptions" {
+			return tracetest.SpanStubFromReadOnlySpan(s)
+		}
+	}
+
+	require.FailNow(t, "the mercure.subscriptions span must have ended")
+
+	return tracetest.SpanStub{}
+}
+
+// spanAttribute returns the value of span's attribute key.
+func spanAttribute(span tracetest.SpanStub, key attribute.Key) attribute.Value {
+	for _, attr := range span.Attributes {
+		if attr.Key == key {
+			return attr.Value
+		}
+	}
+
+	return attribute.Value{}
+}
+
+// A GetSubscribers failure answers 500, or 503 for a list larger than the
+// transport will build. A closed transport's refusal is logged at Debug, any
+// other failure at ERROR.
+func TestSubscriptionsHandlerGetSubscribersError(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantLevel  slog.Level
+	}{
+		{name: "closed transport", err: ownClosedTransportError{}, wantStatus: http.StatusInternalServerError, wantLevel: slog.LevelDebug},
+		{name: "too many subscribers", err: fmt.Errorf("transport: %w", ErrTooManySubscribers), wantStatus: http.StatusServiceUnavailable, wantLevel: slog.LevelError},
+		{name: "other error", err: errGetSubscribers, wantStatus: http.StatusInternalServerError, wantLevel: slog.LevelError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			logs := &recordingLogHandler{}
+			transport := &getSubscribersErrorTransport{LocalTransport: NewLocalTransport(NewSubscriberList(0)), err: tc.err}
+			hub := createDummy(t, WithTransport(transport), WithLogger(slog.New(logs)))
+
+			req := httptest.NewRequest(http.MethodGet, subscriptionsURL, nil)
+			req.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(roleSubscriber, []string{"/.well-known/mercure/subscriptions"})})
+
+			w := httptest.NewRecorder()
+			hub.SubscriptionsHandler(w, req)
+
+			assert.Equal(t, tc.wantStatus, w.Code)
+			assert.Equal(t, http.StatusText(tc.wantStatus)+"\n", w.Body.String())
+			assertLoggedOnceAt(t, logs, "Error retrieving subscribers", tc.wantLevel)
+		})
+	}
+}
+
+// Invoked with a transport that cannot list subscribers, both subscription
+// handlers answer 500 and record the failure instead of panicking.
+func TestSubscriptionHandlersTransportWithoutSubscribers(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		jwtTopic string
+		invoke   func(*Hub, http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:     "SubscriptionsHandler",
+			path:     subscriptionsURL,
+			jwtTopic: "/.well-known/mercure/subscriptions",
+			invoke:   (*Hub).SubscriptionsHandler,
+		},
+		{
+			name:     "SubscriptionHandler",
+			path:     subscriptionsURL + "/exact/foo/bar",
+			jwtTopic: "/.well-known/mercure/subscriptions/exact/foo/bar",
+			invoke: func(h *Hub, w http.ResponseWriter, r *http.Request) {
+				router := mux.NewRouter()
+				router.HandleFunc(subscriptionMatchURL, h.SubscriptionHandler)
+				router.ServeHTTP(w, r)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, sr := spanRecorder(t)
+			logs := &recordingLogHandler{}
+			hub := createDummy(t, WithTransport(&nonSubscribersTransport{}), WithLogger(slog.New(logs)))
+
+			req := httptest.NewRequestWithContext(ctx, http.MethodGet, tc.path, nil)
+			req.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(roleSubscriber, []string{tc.jwtTopic})})
+
+			w := httptest.NewRecorder()
+
+			require.NotPanics(t, func() { tc.invoke(hub, w, req) })
+
+			assert.Equal(t, http.StatusInternalServerError, w.Code)
+			assert.Len(t, logs.withError(slog.LevelError, errTransportDoesNotSupportSubscribers), 1, "records: %v", logs.messages())
+
+			span := subscriptionsSpan(t, sr)
+			assert.Equal(t, codes.Error, span.Status.Code)
+			assert.Equal(t, "transport_does_not_support_subscribers", spanAttribute(span, "error.type").AsString())
+		})
+	}
+}
+
+// A 304 leaves the span status unset and marks the span as a cache hit.
+func TestSubscriptionsHandlerCacheHitAttribute(t *testing.T) {
+	t.Parallel()
+
+	ctx, sr := spanRecorder(t)
+	hub := createDummy(t)
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, subscriptionsURL, nil)
+	req.Header.Set("If-None-Match", `"`+EarliestLastEventID+`"`)
+	req.AddCookie(&http.Cookie{Name: defaultCookieName, Value: createDummyAuthorizedJWT(roleSubscriber, []string{"/.well-known/mercure/subscriptions"})})
+
+	w := httptest.NewRecorder()
+	hub.SubscriptionsHandler(w, req)
+
+	require.Equal(t, http.StatusNotModified, w.Code)
+
+	span := subscriptionsSpan(t, sr)
+	assert.Equal(t, codes.Unset, span.Status.Code)
+	assert.True(t, spanAttribute(span, "mercure.subscriptions.cache_hit").AsBool())
 }

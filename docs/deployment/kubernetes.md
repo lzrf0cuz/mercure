@@ -24,7 +24,7 @@ Default values produce a single-replica deployment with BoltDB, a `ClusterIP` se
 
 With the default `RollingUpdate` strategy, the chart sets:
 
-- `terminationGracePeriodSeconds: 660`: matches the 600s `write_timeout` plus margin so pods drain cleanly. See [Rolling updates](../production/rolling-updates.md).
+- `terminationGracePeriodSeconds: 660`: matches the 600s `write_timeout` plus margin so pods drain cleanly. Images built from this repository set a short `grace_period`; see [Rolling updates](../production/rolling-updates.md).
 - `strategy.rollingUpdate.maxSurge: 1, maxUnavailable: 0`: one replica rotates at a time without dropping capacity.
 - `minReadySeconds: 30`: a newly-Ready replica gets time to warm its transport before the next rotation.
 
